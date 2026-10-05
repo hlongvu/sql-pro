@@ -1,0 +1,27 @@
+[package]
+name = "sqlpro-drivers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["sqlite", "postgres", "mysql"]
+sqlite = ["dep:rusqlite"]
+postgres = ["dep:tokio-postgres", "dep:tokio", "dep:rust_decimal", "dep:chrono", "dep:futures", "dep:uuid"]
+mysql = ["dep:mysql_async", "dep:tokio"]
+
+[dependencies]
+sqlpro-core.workspace = true
+
+async-trait.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+uuid = { workspace = true, optional = true }
+
+rusqlite = { workspace = true, optional = true }
+tokio-postgres = { workspace = true, optional = true }
+mysql_async = { workspace = true, optional = true }
+rust_decimal = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }

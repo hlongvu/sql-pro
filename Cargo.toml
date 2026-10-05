@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/drivers", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+authors = ["SQL Pro contributors"]
+
+[workspace.dependencies]
+sqlpro-core = { path = "crates/core" }
+sqlpro-drivers = { path = "crates/drivers" }
+
+# UI
+gpui-kit = "0.7"
+
+# Async runtime + drivers
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+async-trait = "0.1"
+futures = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
+rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
+mysql_async = { version = "0.34", default-features = false, features = ["minimal", "derive"] }
+
+# Shared
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
