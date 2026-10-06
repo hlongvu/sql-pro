@@ -60,8 +60,31 @@ const COLOR_AMBER: u32 = 0xD29922;
 const COLOR_RED: u32 = 0xF85149;
 const COLOR_HOVER: u32 = 0x2B2E34;
 
-fn color(rgb: u32) -> Hsla {
-    gpui::rgb(rgb).into()
+/// Resolve a chrome color for the active theme: the constants are the dark
+/// palette; light mode maps each to its light counterpart.
+fn color(rgb_value: u32) -> Hsla {
+    let resolved = if crate::theme::is_dark() {
+        rgb_value
+    } else {
+        match rgb_value {
+            COLOR_BG => 0xFFFFFF,
+            COLOR_SURFACE => 0xF5F5F6,
+            COLOR_SURFACE2 => 0xF7F7F8,
+            COLOR_EDITOR => 0xFFFFFF,
+            COLOR_BORDER => 0xE2E2E5,
+            COLOR_BORDER_SOFT => 0xECECEE,
+            COLOR_TEXT => 0x1D1D1F,
+            COLOR_MUTED => 0x86868B,
+            COLOR_GREEN => 0x28A745,
+            COLOR_AMBER => 0xF0A020,
+            COLOR_RED => 0xD9534F,
+            COLOR_HOVER => 0xE8E8EA,
+            // PK-badge background tint.
+            0x3A2E14 => 0xFDF3D8,
+            other => other,
+        }
+    };
+    gpui::rgb(resolved).into()
 }
 
 /// State of the active connection (drives the status dot colors).
@@ -174,6 +197,7 @@ pub struct Workspace {
     inspector_tab: usize, // 0 = Details, 1 = Assistant
     grid_mode: GridMode,
     safe_mode: SafeMode,
+    dark_mode: bool,
     conn_search: Entity<InputState>,
     objects_search: Entity<InputState>,
     inspector_search: Entity<InputState>,
@@ -257,6 +281,7 @@ impl Workspace {
             inspector_tab: 0,
             grid_mode: GridMode::Data,
             safe_mode: SafeMode::Warn,
+            dark_mode: true,
             conn_search,
             objects_search,
             inspector_search,
@@ -1165,7 +1190,35 @@ impl Render for Workspace {
                                 ),
                         )
                     })
-                    .child(div().child(format!("1–{shown} of {total} rows"))),
+                    .child(div().child(format!("1–{shown} of {total} rows")))
+                    // Light/dark theme toggle
+                    .child(
+                        Button::new("theme-toggle")
+                            .ghost()
+                            .xsmall()
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .line_height(px(1.))
+                                            .child(if self.dark_mode { "☀" } else { "☾" }),
+                                    )
+                                    .child(if self.dark_mode { "Light" } else { "Dark" }),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.dark_mode = !this.dark_mode;
+                                crate::theme::apply(this.dark_mode, cx);
+                                this.status = if this.dark_mode {
+                                    "Dark theme"
+                                } else {
+                                    "Light theme"
+                                }
+                                .into();
+                                cx.notify();
+                            })),
+                    ),
             )
     }
 }
