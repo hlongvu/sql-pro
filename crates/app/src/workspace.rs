@@ -17,8 +17,12 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Editor, EditorState, Input, InputState};
-use gpui_kit::component::table::TableState;
+use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_kit::component::menu::ContextMenuExt;
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::table::{TableEvent, TableState};
+use gpui_kit::component::WindowExt;
 use gpui_kit::component::{h_flex, v_flex, Disableable, Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -32,14 +36,21 @@ use sqlpro_core::schema::{ColumnInfo, TableInfo};
 use sqlpro_core::sqlgen::{SqlStatementGenerator, DEFAULT_MARKER};
 use sqlpro_core::value::CellValue;
 use sqlpro_core::write::{
-    engine_reports_real_counts, DataWriteExecutor, DataWritePlan, ParameterizedExecutor,
-    TransactionOwner,
+    engine_reports_real_counts, DataWriteExecutor, DataWritePlan, DataWriteResult,
+    ParameterizedExecutor, TransactionOwner,
 };
 
 use crate::grid::{ResultsDelegate, RowVisual};
 use crate::store;
 
-actions!(workspace, [RunQuery, NewQuery, SaveChanges]);
+actions!(
+    workspace,
+    [
+        RunQuery, NewQuery, SaveChanges,
+        EditCell, CopyCell, CopyRowJson, CopyRowYaml, CopyRowCsv, InsertRow, DeleteRow,
+        CancelCellEdit,
+    ]
+);
 
 const DEFAULT_ROW_LIMIT: usize = 500;
 const HISTORY_PANEL_SIZE: usize = 30;
@@ -198,13 +209,21 @@ pub struct Workspace {
     grid_mode: GridMode,
     safe_mode: SafeMode,
     dark_mode: bool,
+    /// Two-step guard: closing with staged changes needs a second press.
+    close_confirmed: bool,
+    /// Database switcher on the same server (objects-pane footer popover).
+    db_switch_open: bool,
+    db_switch_loading: bool,
+    discovered_dbs: Vec<String>,
     conn_search: Entity<InputState>,
     objects_search: Entity<InputState>,
     inspector_search: Entity<InputState>,
 
     editor: Entity<EditorState>,
     table: Entity<TableState<ResultsDelegate>>,
-    cell_input: Entity<InputState>,
+    /// Inline cell editor: rendered directly inside the cell being edited.
+    cell_editor: Entity<InputState>,
+    editing_cell: Option<(usize, usize)>,
     form: ConnectionForm,
 }
 
@@ -227,8 +246,7 @@ impl Workspace {
                 .row_selectable(true)
                 .cell_selectable(true)
         });
-        let cell_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Selected cell value"));
+        let cell_editor = cx.new(|cx| InputState::new(window, cx).placeholder(""));
         let conn_search =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search connections"));
         let objects_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search objects"));
@@ -243,6 +261,40 @@ impl Workspace {
 
         let history =
             QueryHistoryStorage::open(&sqlpro_core::history::default_history_path()).ok();
+
+        // Right-click on the grid moves the selection to the clicked
+        // row/cell, so context-menu actions operate on the right-clicked
+        // target even without a prior left-click. Double-click starts
+        // inline editing directly on the cell.
+        cx.subscribe_in(&table, window, |this, _, event: &TableEvent, window, cx| {
+            match event {
+                TableEvent::RightClickedCell(row, col) => {
+                    this.table.update(cx, |t, cx| t.set_selected_cell(*row, *col, cx));
+                }
+                TableEvent::RightClickedRow(Some(row)) => {
+                    this.table.update(cx, |t, cx| t.set_selected_row(*row, cx));
+                }
+                TableEvent::DoubleClickedCell(row, col) => {
+                    let cell = (*row, *col);
+                    this.begin_cell_edit(Some(cell), window, cx);
+                }
+                _ => {}
+            }
+        })
+        .detach();
+
+        // ⏎ in the inline cell editor stages the value ("confirm but don't
+        // apply yet"); ⌘S is what writes staged changes to the database.
+        // Clicking away (blur) stages the in-progress value too.
+        cx.subscribe_in(&cell_editor, window, |this, _, event: &InputEvent, window, cx| {
+            match event {
+                InputEvent::PressEnter { .. } => this.commit_cell_edit(window, cx),
+                InputEvent::Blur => this.commit_cell_edit(window, cx),
+                _ => {}
+            }
+        })
+        .detach();
+
         let history_entries = history
             .as_ref()
             .map(|h| {
@@ -282,42 +334,72 @@ impl Workspace {
             grid_mode: GridMode::Data,
             safe_mode: SafeMode::Warn,
             dark_mode: true,
+            close_confirmed: false,
+            db_switch_open: false,
+            db_switch_loading: false,
+            discovered_dbs: Vec::new(),
             conn_search,
             objects_search,
             inspector_search,
             editor,
             table,
-            cell_input,
+            cell_editor,
+            editing_cell: None,
             form,
         };
 
-        ws.bind_keys(cx);
+        // Keyboard shortcuts (⌘S save, ⌘⏎ run, ⌘E/⌘T new query, Escape
+        // cancel) are registered directly as window key listeners in
+        // `render` rather than through the keymap, so they fire no matter
+        // which element holds focus.
+
+        // The macOS close button closes the *connection*, not the app:
+        // while a database is connected the window stays open and shows the
+        // welcome screen again. Staged changes require a second press.
+        {
+            let entity = cx.entity();
+            window.on_window_should_close(cx, move |_window, cx| {
+                let allow_close = std::cell::Cell::new(true);
+                let _ = entity.update(cx, |ws, cx| {
+                    if ws.driver.is_none() {
+                        // Welcome screen: the red button quits the app.
+                        return;
+                    }
+                    if ws.running {
+                        ws.status = "Busy — wait for the current operation to finish".into();
+                        allow_close.set(false);
+                        return;
+                    }
+                    if !ws.pending.is_empty() && !ws.close_confirmed {
+                        ws.close_confirmed = true;
+                        ws.status = format!(
+                            "{} staged change(s) will be discarded — press close again to confirm",
+                            ws.pending.changes.len()
+                        );
+                        allow_close.set(false);
+                        return;
+                    }
+                    allow_close.set(false);
+                    ws.disconnect(cx);
+                });
+                allow_close.into_inner()
+            });
+        }
 
         // Optional auto-connect for a saved connection, e.g.
-        // SQLPRO_CONNECT="dental_hub (local)". Without it, open the
-        // in-memory demo database so a fresh install works with zero setup.
-        match std::env::var("SQLPRO_CONNECT") {
-            Ok(name) => match ws.connections.iter().position(|c| c.name == name) {
+        // SQLPRO_CONNECT="dental_hub (local)". Without it, the app opens on
+        // the welcome/start screen (shown while no driver is connected).
+        if let Ok(name) = std::env::var("SQLPRO_CONNECT") {
+            match ws.connections.iter().position(|c| c.name == name) {
                 Some(ix) => ws.connect_saved(ix, window, cx),
                 None => {
                     ws.status = format!("No saved connection named \"{name}\"");
                     ws.connect_demo(window, cx);
                 }
-            },
-            Err(_) => ws.connect_demo(window, cx),
+            }
         }
 
         ws
-    }
-
-    fn bind_keys(&self, cx: &mut Context<Self>) {
-        let mod_key = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
-        cx.bind_keys([
-            KeyBinding::new(&format!("{mod_key}-enter"), RunQuery, None),
-            KeyBinding::new(&format!("{mod_key}-e"), NewQuery, None),
-            KeyBinding::new(&format!("{mod_key}-t"), NewQuery, None),
-            KeyBinding::new(&format!("{mod_key}-s"), SaveChanges, None),
-        ]);
     }
 
     fn conn_state(&self) -> ConnState {
@@ -365,6 +447,11 @@ impl Workspace {
             .is_some_and(|a| a.id == config.id && self.driver.is_some())
         {
             self.status = format!("Already connected: {}", config.name);
+            self.toast(
+                Notification::info(format!("Already connected: {}", config.name)),
+                window,
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -397,6 +484,11 @@ impl Workspace {
         if let Err(e) = validate(&config) {
             self.status = format!("Invalid connection: {e}");
             self.log_console(false, "connect", &e.to_string());
+            self.toast(
+                Notification::error(e.to_string()).title("Invalid connection"),
+                window,
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -447,7 +539,7 @@ impl Workspace {
                 Err(_) => Vec::new(),
             };
 
-            _ = this.update(cx, |ws, cx| {
+            _ = this.update_in(cx, |ws, window, cx| {
                 ws.running = false;
                 match outcome {
                     Ok(driver) => {
@@ -457,6 +549,15 @@ impl Workspace {
                             &format!("{} tables", tables.len()),
                         );
                         ws.status = format!("Connected: {}", driver.label());
+                        ws.toast(
+                            Notification::success(format!(
+                                "Connected: {} — {} tables",
+                                driver.label(),
+                                tables.len()
+                            )),
+                            window,
+                            cx,
+                        );
                         ws.driver = Some(driver);
                         ws.active = Some(config);
                         ws.tables = tables;
@@ -464,7 +565,12 @@ impl Workspace {
                     Err(e) => {
                         ws.log_console(false, &format!("connect {}", config.name), &e);
                         ws.status = format!("Connection failed: {e}");
-                        ws.last_error = Some(e);
+                        ws.last_error = Some(e.clone());
+                        ws.toast(
+                            Notification::error(e).title("Connection failed"),
+                            window,
+                            cx,
+                        );
                     }
                 }
                 cx.notify();
@@ -473,7 +579,152 @@ impl Workspace {
         .detach();
     }
 
+    /// Close the active connection and return to the welcome screen. With
+    /// staged changes present, the first press asks for confirmation.
+    fn disconnect(&mut self, cx: &mut Context<Self>) {
+        if self.running {
+            self.status = "Busy — wait for the current operation to finish".into();
+            cx.notify();
+            return;
+        }
+        if !self.pending.is_empty() && !self.close_confirmed {
+            self.close_confirmed = true;
+            self.status = format!(
+                "{} staged change(s) will be discarded — press close again to confirm",
+                self.pending.changes.len()
+            );
+            cx.notify();
+            return;
+        }
+        self.close_confirmed = false;
+        let name = self
+            .active
+            .as_ref()
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        self.driver = None;
+        self.active = None;
+        self.tables.clear();
+        self.active_table = None;
+        self.table_name.clear();
+        self.pk_columns.clear();
+        self.structure.clear();
+        self.columns.clear();
+        self.original_rows.clear();
+        self.rows.clear();
+        self.row_ids.clear();
+        self.result_row_total = None;
+        self.last_result = None;
+        self.last_error = None;
+        self.pending.clear();
+        self.editing_cell = None;
+        self.grid_mode = GridMode::Data;
+        self.table.update(cx, |table, cx| {
+            *table.delegate_mut() = ResultsDelegate::empty();
+            table.refresh(cx);
+        });
+        self.log_console(true, &format!("disconnect {name}"), "closed");
+        self.status = format!("Closed connection {name}");
+        cx.notify();
+    }
+
+    // ---- Database switcher (same server) --------------------------------
+
+    /// List the other databases on the current server, using the active
+    /// connection's credentials. PostgreSQL and MySQL only.
+    fn discover_databases(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.db_switch_open {
+            self.db_switch_open = false;
+            cx.notify();
+            return;
+        }
+        let Some(driver) = self.driver.clone() else { return };
+        let engine = self
+            .active
+            .as_ref()
+            .map(|c| c.database_type.clone())
+            .unwrap_or_else(|| DatabaseType::new(DatabaseType::SQLITE));
+        let query = match engine.driver_id() {
+            "postgresql" => {
+                "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY 1"
+                    .to_string()
+            }
+            "mysql" => "SHOW DATABASES".to_string(),
+            _ => {
+                self.status =
+                    "Database switching is not supported for this engine".into();
+                cx.notify();
+                return;
+            }
+        };
+
+        self.db_switch_open = true;
+        self.db_switch_loading = true;
+        self.discovered_dbs.clear();
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result =
+                sqlpro_drivers::runtime::on_tokio(async move { driver.execute(&query).await })
+                    .await;
+            _ = this.update(cx, |ws, cx| {
+                ws.db_switch_loading = false;
+                match result {
+                    Ok(r) => {
+                        let mut dbs: Vec<String> = r
+                            .rows
+                            .iter()
+                            .filter_map(|row| row.first())
+                            .filter_map(|c| match c {
+                                CellValue::Text(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        if engine.driver_id() == "mysql" {
+                            let system = ["information_schema", "mysql", "performance_schema", "sys"];
+                            dbs.retain(|d| !system.contains(&d.as_str()));
+                        }
+                        let current =
+                            ws.active.as_ref().and_then(|c| c.database.clone());
+                        dbs.retain(|d| Some(d) != current.as_ref());
+                        ws.discovered_dbs = dbs;
+                    }
+                    Err(e) => {
+                        ws.status = format!("Database discovery failed: {e}");
+                        ws.db_switch_open = false;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Reconnect with the same credentials to a different database on the
+    /// same server. Not persisted to the saved-connection list.
+    fn reconnect_to_database(
+        &mut self,
+        db: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.active.clone() else { return };
+        let mut config = (*active).clone();
+        config.database = Some(db.to_string());
+        self.db_switch_open = false;
+        self.status = format!("Switching to {db}…");
+        cx.notify();
+        self.connect(Arc::new(config), None, window, cx);
+    }
+
     // ---- Queries -------------------------------------------------------
+
+    /// Surface a one-shot outcome (save/export results, copy confirmations,
+    /// "select a cell first" hints) as a toast — the 26px status bar alone
+    /// is too easy to miss.
+    fn toast(&self, note: Notification, window: &mut Window, cx: &mut Context<Self>) {
+        window.push_notification(note, cx);
+    }
 
     fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
         if self.running {
@@ -481,6 +732,7 @@ impl Workspace {
         }
         let Some(driver) = self.driver.clone() else {
             self.status = "Not connected".into();
+            self.toast(Notification::warning("Not connected — choose a connection first"), window, cx);
             cx.notify();
             return;
         };
@@ -498,7 +750,7 @@ impl Workspace {
             let result = driver.execute(&sql).await;
             let elapsed = started.elapsed().as_secs_f64() * 1000.0;
 
-            _ = this.update(cx, |ws, cx| {
+            _ = this.update_in(cx, |ws, window, cx| {
                 ws.running = false;
                 let one_line: String =
                     sql.lines().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
@@ -528,8 +780,14 @@ impl Workspace {
                     }
                     Err(e) => {
                         ws.log_console(false, &clipped, &e.to_string());
+                        eprintln!("query failed: {e}");
                         ws.status = format!("Error: {e}");
                         ws.last_error = Some(e.to_string());
+                        ws.toast(
+                            Notification::error(e.to_string()).title("Query failed"),
+                            window,
+                            cx,
+                        );
                         ws.record_history(&sql, std::time::Duration::from_millis(elapsed as u64), false, Some(&e.to_string()), cx);
                     }
                 }
@@ -580,6 +838,8 @@ impl Workspace {
                 columns: result.columns.iter().map(|c| c.name.clone()).collect(),
                 rows: result.rows,
                 visual: Vec::new(),
+                editing: None,
+                editor: Some(self.cell_editor.clone()),
             };
             table.refresh(cx);
         });
@@ -659,13 +919,15 @@ impl Workspace {
 
     // ---- Cell editing (the DataChangeManager pipeline) ------------------
 
-    fn apply_cell_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let new_text = self.cell_input.read(cx).value().to_string();
-        let Some((row_ix, col_ix)) = self.selected_cell(cx) else {
-            self.status = "Select a cell first".into();
-            cx.notify();
-            return;
-        };
+    /// Stage a new value for one cell: record the change in PendingChanges
+    /// (visible as a tint, not written) and update the displayed row.
+    fn stage_cell_value(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        new_text: String,
+        cx: &mut Context<Self>,
+    ) {
         let Some(row_id) = self.row_ids.get(row_ix).copied() else { return };
         let Some(column) = self.columns.get(col_ix).cloned() else { return };
         let old_value = self
@@ -694,14 +956,154 @@ impl Workspace {
         if changed {
             if let Some(row) = self.rows.get_mut(row_ix) {
                 if let Some(cell) = row.get_mut(col_ix) {
-                    *cell = new_value;
+                    *cell = new_value.clone();
                 }
             }
         }
-        let _ = window;
-        self.status = self.pending_status_text();
+        self.status = format!(
+            "Staged: {} = {} — ⌘S writes to the database",
+            column.name,
+            match &new_value {
+                CellValue::Null => "NULL".to_string(),
+                CellValue::Text(t) => t.clone(),
+                CellValue::Bytes(_) => "<binary>".to_string(),
+            }
+        );
         self.refresh_grid(cx);
         cx.notify();
+    }
+
+    /// Commit the inline cell editor's value into the staged changes and
+    /// leave editing mode.
+    fn commit_cell_edit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some((row_ix, col_ix)) = self.editing_cell else { return };
+        self.editing_cell = None;
+        let new_text = self.cell_editor.read(cx).value().to_string();
+        self.stage_cell_value(row_ix, col_ix, new_text, cx);
+        self.sync_delegate_editing(cx);
+    }
+
+    /// Cancel inline editing without staging anything (Escape).
+    fn cancel_cell_edit(&mut self, cx: &mut Context<Self>) {
+        if self.editing_cell.take().is_some() {
+            self.status = "Cell edit cancelled".into();
+            self.sync_delegate_editing(cx);
+            cx.notify();
+        }
+    }
+
+    /// Push the current editing cell + editor entity into the grid delegate
+    /// so `render_td` draws the editor inside the cell.
+    fn sync_delegate_editing(&mut self, cx: &mut Context<Self>) {
+        let editing = self.editing_cell;
+        let editor = Some(self.cell_editor.clone());
+        self.table.update(cx, |table, cx| {
+            table.delegate_mut().editing = editing;
+            table.delegate_mut().editor = editor;
+            table.refresh(cx);
+        });
+    }
+
+    /// "Edit cell" from the row context menu (or a double-click): render
+    /// the editor inside the cell and focus it. Enter stages, ⌘S saves.
+    fn begin_cell_edit(
+        &mut self,
+        cell: Option<(usize, usize)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = cell.or_else(|| self.selected_cell(cx));
+        let Some((row_ix, col_ix)) = target else {
+            self.status = "Select a cell first".into();
+            self.toast(Notification::warning("Select a cell first"), window, cx);
+            cx.notify();
+            return;
+        };
+        if self.editing_cell.is_some_and(|c| c == (row_ix, col_ix)) {
+            return;
+        }
+        // A previous inline edit that never saw Enter is staged on blur
+        // before the new cell takes over.
+        if self.editing_cell.is_some() {
+            self.commit_cell_edit(window, cx);
+        }
+        let value = self
+            .rows
+            .get(row_ix)
+            .and_then(|r| r.get(col_ix))
+            .map(|c| match c {
+                CellValue::Null => String::new(),
+                other => other.display(),
+            })
+            .unwrap_or_default();
+        let column = self
+            .columns
+            .get(col_ix)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "cell".into());
+
+        self.editing_cell = Some((row_ix, col_ix));
+        self.cell_editor.update(cx, |state, cx| {
+            state.set_value(value, window, cx);
+            state.focus(window, cx);
+        });
+        self.sync_delegate_editing(cx);
+        self.status = format!("Editing {column} — ⏎ to stage, ⌘S to save");
+        cx.notify();
+    }
+
+    fn copy_cell_value(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((row_ix, col_ix)) = self.selected_cell(cx) else {
+            self.status = "Select a cell first".into();
+            self.toast(Notification::warning("Select a cell first"), window, cx);
+            cx.notify();
+            return;
+        };
+        let text = self
+            .rows
+            .get(row_ix)
+            .and_then(|r| r.get(col_ix))
+            .map(|c| c.display())
+            .unwrap_or_default();
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.status = "Cell copied".into();
+        self.toast(Notification::success("Cell copied"), window, cx);
+        cx.notify();
+    }
+
+    // ---- Context-menu action handlers -----------------------------------
+
+    fn edit_cell_action(
+        &mut self,
+        _: &EditCell,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_cell_edit(None, window, cx);
+    }
+
+    fn copy_cell_action(&mut self, _: &CopyCell, window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_cell_value(window, cx);
+    }
+
+    fn copy_row_json_action(&mut self, _: &CopyRowJson, window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_row_as(RowCopyFormat::Json, window, cx);
+    }
+
+    fn copy_row_yaml_action(&mut self, _: &CopyRowYaml, window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_row_as(RowCopyFormat::Yaml, window, cx);
+    }
+
+    fn copy_row_csv_action(&mut self, _: &CopyRowCsv, window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_row_as(RowCopyFormat::Csv, window, cx);
+    }
+
+    fn insert_row_action(&mut self, _: &InsertRow, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_row(window, cx);
+    }
+
+    fn delete_row_action(&mut self, _: &DeleteRow, window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_row(window, cx);
     }
 
     fn pending_status_text(&self) -> String {
@@ -714,9 +1116,10 @@ impl Workspace {
         )
     }
 
-    fn insert_row(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn insert_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.columns.is_empty() {
             self.status = "Open a table first".into();
+            self.toast(Notification::warning("Open a table first"), window, cx);
             cx.notify();
             return;
         }
@@ -736,9 +1139,10 @@ impl Workspace {
         cx.notify();
     }
 
-    fn delete_row(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn delete_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(row_ix) = self.selected_row(cx) else {
             self.status = "Select a row first".into();
+            self.toast(Notification::warning("Select a row first"), window, cx);
             cx.notify();
             return;
         };
@@ -758,9 +1162,19 @@ impl Workspace {
         cx.notify();
     }
 
-    fn save_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn save_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // An inline edit still open — typed but not confirmed with Enter —
+        // is staged first, so ⌘S applies exactly what's on screen.
+        if self.editing_cell.is_some() {
+            self.commit_cell_edit(window, cx);
+        }
         if self.pending.is_empty() {
             self.status = "Nothing to save".into();
+            self.toast(
+                Notification::info("Nothing to save — edit a cell, or insert/delete a row first"),
+                window,
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -781,37 +1195,64 @@ impl Workspace {
 
         cx.spawn_in(window, async move |this, cx| {
             let real_counts = engine_reports_real_counts(&engine);
-            let outcome = sqlpro_drivers::runtime::on_tokio(async move {
-                let generator = SqlStatementGenerator::new(
-                    table_name,
-                    None,
-                    columns,
-                    pk,
-                    engine.clone(),
-                    Default::default(),
-                    Default::default(),
-                    None,
-                    false,
-                    None,
-                );
-                let attributed = generator.generate_attributed_statements(
-                    &snapshot.changes,
-                    &snapshot.inserted_row_data,
-                    &snapshot.deleted_row_ids,
-                    &snapshot.inserted_row_ids,
-                );
-                let plan =
-                    DataWritePlan::from_attributed(attributed, has_pk, TransactionOwner::App);
-                let executor = DataWriteExecutor { driver: driver.as_ref(), real_counts };
-                executor.run(&plan).await
-            })
-            .await;
+            let outcome: std::result::Result<(DataWriteResult, Vec<String>), String> =
+                sqlpro_drivers::runtime::on_tokio(async move {
+                    let generator = SqlStatementGenerator::new(
+                        table_name,
+                        None,
+                        columns,
+                        pk,
+                        engine.clone(),
+                        Default::default(),
+                        Default::default(),
+                        None,
+                        false,
+                        None,
+                    );
+                    let attributed = generator.generate_attributed_statements(
+                        &snapshot.changes,
+                        &snapshot.inserted_row_data,
+                        &snapshot.deleted_row_ids,
+                        &snapshot.inserted_row_ids,
+                    );
+                    if attributed.is_empty() {
+                        // Silently executing nothing would look like a
+                        // successful save; surface why instead.
+                        return Err(
+                            "no SQL could be generated for the staged changes — the row's \
+                             key value is missing (NULL primary key?), so the edit cannot be \
+                             matched. Reload the table and retry."
+                                .to_string(),
+                        );
+                    }
+                    let sql_texts: Vec<String> = attributed
+                        .iter()
+                        .map(|a| a.statement.sql.clone())
+                        .collect();
+                    let plan =
+                        DataWritePlan::from_attributed(attributed, has_pk, TransactionOwner::App);
+                    let executor = DataWriteExecutor { driver: driver.as_ref(), real_counts };
+                    executor
+                        .run(&plan)
+                        .await
+                        .map(|result| (result, sql_texts))
+                        .map_err(|e| e.to_string())
+                })
+                .await;
 
             _ = this.update_in(cx, |ws, window, cx| {
                 match outcome {
-                    Ok(result) => {
+                    Ok((result, sqls)) => {
                         let affected: usize =
                             result.executed.iter().map(|s| s.rows_affected as usize).sum();
+                        for (step, sql) in result.executed.iter().zip(&sqls) {
+                            ws.log_console(
+                                true,
+                                sql,
+                                &format!("{} row(s) affected", step.rows_affected),
+                            );
+                            eprintln!("save ok: {sql}");
+                        }
                         ws.log_console(
                             true,
                             "commit",
@@ -825,13 +1266,28 @@ impl Workspace {
                             result.executed.len()
                         );
                         ws.last_error = None;
+                        ws.toast(
+                            Notification::success(format!(
+                                "{} statement(s), {affected} row(s) affected",
+                                result.executed.len()
+                            ))
+                            .title("Save complete"),
+                            window,
+                            cx,
+                        );
                         ws.pending.clear();
                         ws.reload_current_table(window, cx);
                     }
                     Err(e) => {
-                        ws.log_console(false, "commit", &e.to_string());
+                        ws.log_console(false, "commit", &e.clone());
+                        eprintln!("save failed: {e}");
                         ws.status = format!("Save failed: {e}");
-                        ws.last_error = Some(e.to_string());
+                        ws.last_error = Some(e.clone());
+                        ws.toast(
+                            Notification::error(e).title("Save failed"),
+                            window,
+                            cx,
+                        );
                     }
                 }
                 cx.notify();
@@ -856,7 +1312,7 @@ impl Workspace {
         self.run_query(&RunQuery, window, cx);
     }
 
-    fn revert_changes(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn revert_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pending.clear();
         let original_len = self.original_rows.len();
         self.rows.truncate(original_len);
@@ -868,14 +1324,20 @@ impl Workspace {
         self.row_ids = (0..original_len as i64).map(RowID::Existing).collect();
         self.refresh_grid(cx);
         self.status = "Reverted all staged changes".into();
+        self.toast(
+            Notification::info("Reverted all staged changes"),
+            window,
+            cx,
+        );
         cx.notify();
     }
 
     // ---- Export --------------------------------------------------------
 
-    fn export_csv(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn export_csv(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.rows.is_empty() {
             self.status = "No rows to export".into();
+            self.toast(Notification::warning("No rows to export"), window, cx);
             cx.notify();
             return;
         }
@@ -904,9 +1366,24 @@ impl Workspace {
             Ok(_) => {
                 self.status =
                     format!("Exported {} rows to {}", self.rows.len(), path.display());
+                self.toast(
+                    Notification::success(format!(
+                        "{} rows written to {}",
+                        self.rows.len(),
+                        path.display()
+                    ))
+                    .title("Export complete"),
+                    window,
+                    cx,
+                );
             }
             Err(e) => {
                 self.status = format!("Export failed: {e}");
+                self.toast(
+                    Notification::error(e.to_string()).title("Export failed"),
+                    window,
+                    cx,
+                );
             }
         }
         cx.notify();
@@ -916,9 +1393,19 @@ impl Workspace {
 
     /// Copy only the currently selected row to the clipboard in the given
     /// format (JSON object, YAML document, or CSV with a header line).
-    fn copy_row_as(&mut self, format: RowCopyFormat, cx: &mut Context<Self>) {
+    fn copy_row_as(
+        &mut self,
+        format: RowCopyFormat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(row_ix) = self.selected_row(cx) else {
             self.status = "No row selected — select a row to copy".into();
+            self.toast(
+                Notification::warning("No row selected — select a row to copy"),
+                window,
+                cx,
+            );
             cx.notify();
             return;
         };
@@ -931,6 +1418,15 @@ impl Workspace {
         };
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         self.status = format!("Row {} copied as {}", row_ix + 1, format.label());
+        self.toast(
+            Notification::success(format!(
+                "Row {} copied as {}",
+                row_ix + 1,
+                format.label()
+            )),
+            window,
+            cx,
+        );
         cx.notify();
     }
 
@@ -1013,6 +1509,24 @@ impl Workspace {
         }
     }
 
+    /// Push the current selection back into the table after a delegate
+    /// rebuild, so Apply/row operations keep working after a stage refresh.
+    fn restore_selection(&mut self, cx: &mut Context<Self>) {
+        let selection = self.table.read(cx).selection();
+        let row_count = self.rows.len();
+        if let Some((row, col)) = match selection {
+            gpui_kit::component::table::TableSelection::Cell(r, c) => Some((r, c)),
+            gpui_kit::component::table::TableSelection::Row(r) => Some((r, 0)),
+            _ => None,
+        } {
+            if row < row_count && col < self.columns.len() {
+                self.table.update(cx, |table, cx| {
+                    table.set_selected_cell(row, col, cx);
+                });
+            }
+        }
+    }
+
     fn refresh_grid(&mut self, cx: &mut Context<Self>) {
         let columns = self.columns.iter().map(|c| c.name.clone()).collect();
         let rows = self.rows.clone();
@@ -1027,22 +1541,16 @@ impl Workspace {
             }
         }
         self.table.update(cx, |table, cx| {
-            *table.delegate_mut() = ResultsDelegate { columns, rows, visual };
+            *table.delegate_mut() = ResultsDelegate {
+                columns,
+                rows,
+                visual,
+                editing: self.editing_cell,
+                editor: Some(self.cell_editor.clone()),
+            };
             table.refresh(cx);
         });
-    }
-
-    fn icon_button(
-        &self,
-        id: &'static str,
-        icon: IconName,
-        active: bool,
-    ) -> Button {
-        Button::new(id)
-            .ghost()
-            .small()
-            .when(active, |b| b.primary())
-            .child(Icon::new(icon))
+        self.restore_selection(cx);
     }
 
     /// A toolbar button rendered with a unicode glyph instead of an SVG icon.
@@ -1064,9 +1572,30 @@ impl Workspace {
             "postgresql" => "PostgreSQL",
             "mysql" => "MySQL",
             "sqlite" => "SQLite",
-            other => match other {
-                _ => "Database",
-            },
+            _ => "Database",
+        }
+    }
+
+    /// The circular engine badge on the start screen: letters + color.
+    fn engine_badge(db: &DatabaseType) -> (&'static str, u32) {
+        match db.driver_id() {
+            "postgresql" => ("Pg", 0x2F7CF6),
+            "mysql" => ("My", 0xE68A2E),
+            "sqlite" => ("Sq", 0x3FB950),
+            _ => ("Db", 0x8B909A),
+        }
+    }
+
+    /// A small environment chip for a connection ("local", "demo", …).
+    fn connection_tag(config: &ConnectionConfig) -> Option<(&'static str, u32)> {
+        if config.name.contains("Demo") {
+            Some(("demo", 0x8957E5))
+        } else if matches!(config.host.as_deref(), Some("127.0.0.1") | Some("localhost")) {
+            Some(("local", 0x3FB950))
+        } else if config.host.is_some() {
+            Some(("remote", 0x2F7CF6))
+        } else {
+            None
         }
     }
 
@@ -1104,7 +1633,13 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // No connection yet (and none in progress with a driver): show the
+        // welcome/start screen instead of the four-pane workspace.
+        if self.driver.is_none() {
+            return self.render_start_screen(cx).into_any_element();
+        }
+
         let border = color(COLOR_BORDER);
         let pending_count = self.pending.changes.len();
         let shown = self.rows.len();
@@ -1120,6 +1655,53 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::new_query_action))
             .on_action(cx.listener(Self::save_changes_action))
+            .on_action(cx.listener(Self::edit_cell_action))
+            .on_action(cx.listener(Self::copy_cell_action))
+            .on_action(cx.listener(Self::copy_row_json_action))
+            .on_action(cx.listener(Self::copy_row_yaml_action))
+            .on_action(cx.listener(Self::copy_row_csv_action))
+            .on_action(cx.listener(Self::insert_row_action))
+            .on_action(cx.listener(Self::delete_row_action))
+            // Direct keyboard shortcuts on the root container. Handled in
+            // the bubble phase so focused inputs keep their own keys;
+            // matching is case-insensitive because macOS may deliver "S"
+            // or "s" for the ⌘S keystroke.
+            .on_key_down({
+                let entity = cx.entity();
+                move |event: &KeyDownEvent, window: &mut Window, cx: &mut App| {
+                    let keystroke = event.keystroke.key.to_lowercase();
+                    let cmd = if cfg!(target_os = "macos") {
+                        event.keystroke.modifiers.platform
+                    } else {
+                        event.keystroke.modifiers.control
+                    };
+                    match (keystroke.as_str(), cmd) {
+                        ("s", true) => entity.update(cx, |ws, ws_cx| {
+                            eprintln!(
+                                "shortcut: cmd-s -> save (pending={})",
+                                ws.pending.changes.len()
+                            );
+                            ws.save_changes(window, ws_cx);
+                        }),
+                        ("enter", true) => entity.update(cx, |ws, ws_cx| {
+                            eprintln!("shortcut: cmd-enter -> run query");
+                            ws.run_query(&RunQuery, window, ws_cx);
+                        }),
+                        ("e", true) | ("t", true) => entity.update(cx, |ws, ws_cx| {
+                            ws.new_query(window, ws_cx);
+                        }),
+                        ("escape", false) => entity.update(cx, |ws, ws_cx| {
+                            if ws.db_switch_open {
+                                ws.db_switch_open = false;
+                                ws_cx.notify();
+                            } else {
+                                ws.cancel_cell_edit(ws_cx);
+                            }
+                        }),
+                        _ => {}
+                    }
+                }
+            })
             // ---- Application toolbar ----
             .child(self.render_toolbar(cx))
             // ---- Body: the four panes (navigators fixed, inspector optional) ----
@@ -1161,6 +1743,12 @@ impl Render for Workspace {
                             ),
                     )
                     .child(div().w(px(1.)).h(px(12.)).bg(color(COLOR_BORDER_SOFT)))
+                    // Live indicator while a query/save/connect is in flight
+                    .when(self.running, |bar| {
+                        bar.child(
+                            Spinner::new().xsmall().color(color(COLOR_ACCENT)),
+                        )
+                    })
                     // Result status: duration + counts
                     .when_some(self.last_result, |bar, (ms, count)| {
                         bar.child(div().child(format!("{ms:.0} ms · {count} rows")))
@@ -1220,6 +1808,88 @@ impl Render for Workspace {
                             })),
                     ),
             )
+            // Database switcher popover: full-window backdrop + menu
+            // anchored under the connection pill (painted last = on top).
+            .when(self.db_switch_open, |root| {
+                let current = self.active.as_ref().and_then(|c| c.database.clone());
+                root.child(
+                    div()
+                        .id("db-switch-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.db_switch_open = false;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    v_flex()
+                        .id("db-switch-menu")
+                        .absolute()
+                        .left(px(12.))
+                        .top(px(52.))
+                        .w(px(260.))
+                        .max_h(px(300.))
+                        .overflow_y_scroll()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(border)
+                        .bg(color(COLOR_SURFACE2))
+                        .shadow_lg()
+                        .p_1()
+                        .when(self.db_switch_loading, |menu| {
+                            menu.child(
+                                div()
+                                    .px_2()
+                                    .py_1p5()
+                                    .text_size(px(11.5))
+                                    .text_color(color(COLOR_MUTED))
+                                    .child("Discovering databases…"),
+                            )
+                        })
+                        .when(
+                            !self.db_switch_loading && self.discovered_dbs.is_empty(),
+                            |menu| {
+                                menu.child(
+                                    div()
+                                        .px_2()
+                                        .py_1p5()
+                                        .text_size(px(11.5))
+                                        .text_color(color(COLOR_MUTED))
+                                        .child("No other databases found"),
+                                )
+                            },
+                        )
+                        .children(self.discovered_dbs.iter().map(|db_name| {
+                            let is_current = current.as_ref() == Some(db_name);
+                            let db = db_name.clone();
+                            div()
+                                .id(SharedString::from(format!("db-{db}")))
+                                .h(px(26.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .rounded(px(4.))
+                                .text_size(px(12.))
+                                .hover(|this| this.bg(color(COLOR_HOVER)))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.reconnect_to_database(&db, window, cx)
+                                }))
+                                .child(db_name.clone())
+                                .when(is_current, |row| {
+                                    row.child(
+                                        div()
+                                            .text_size(px(9.5))
+                                            .text_color(color(COLOR_MUTED))
+                                            .child("current"),
+                                    )
+                                })
+                        })),
+                )
+            })
+            .into_any_element()
     }
 }
 
@@ -1233,6 +1903,276 @@ fn when_pending(this: Div, pending_count: usize, status: &str) -> Div {
 }
 
 impl Workspace {
+    // ---- Start screen (no connection yet) ----
+
+    /// The welcome screen shown while no database is connected: branding
+    /// and quick actions on the left, saved connections on the right with
+    /// engine badges, environment tags, and a create row at the bottom.
+    fn render_start_screen(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = color(COLOR_BORDER);
+        let error = self.last_error.clone();
+        let status = self.status.clone();
+        let connecting = self.running && self.driver.is_none();
+
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(color(COLOR_BG))
+            .text_color(color(COLOR_TEXT))
+            .text_size(px(13.))
+            .child(
+                h_flex()
+                    .w(px(680.))
+                    .h(px(480.))
+                    .overflow_hidden()
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(border)
+                    .shadow_lg()
+                    // Left panel: branding + quick actions
+                    .child(
+                        v_flex()
+                            .w(px(260.))
+                            .flex_shrink_0()
+                            .h_full()
+                            .items_center()
+                            .bg(color(COLOR_SURFACE))
+                            .border_r_1()
+                            .border_color(border)
+                            .child(div().flex_1())
+                            .child(
+                                Icon::new(IconName::Database)
+                                    .size(px(52.))
+                                    .text_color(color(COLOR_ACCENT)),
+                            )
+                            .child(
+                                div()
+                                    .mt_4()
+                                    .text_size(px(20.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("Welcome to SQL Pro"),
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_size(px(11.))
+                                    .text_color(color(COLOR_MUTED))
+                                    .child("Version 0.1 · PostgreSQL · MySQL · SQLite"),
+                            )
+                            .when(!status.is_empty() && status != "Ready", |this| {
+                                this.child(
+                                    div()
+                                        .mt_3()
+                                        .max_w(px(260.))
+                                        .text_align(TextAlign::Center)
+                                        .text_size(px(11.))
+                                        .when_some(error.clone(), |this, e| {
+                                            this.text_color(color(COLOR_RED)).child(e)
+                                        })
+                                        .when(error.is_none(), |this| {
+                                            this.text_color(color(COLOR_MUTED)).child(status.clone())
+                                        }),
+                                )
+                            })
+                            .child(div().flex_1())
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .pb(px(28.))
+                                    .child(
+                                        Button::new("start-new-conn")
+                                            .small()
+                                            .outline()
+                                            .child(
+                                                h_flex()
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(12.))
+                                                            .line_height(px(1.))
+                                                            .child("+"),
+                                                    )
+                                                    .child("Connection"),
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.show_form = true;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("start-demo")
+                                            .small()
+                                            .ghost()
+                                            .disabled(connecting)
+                                            .child(
+                                                h_flex()
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(12.))
+                                                            .line_height(px(1.))
+                                                            .child("▤"),
+                                                    )
+                                                    .child("Demo DB"),
+                                            )
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.connect_demo(window, cx)
+                                            })),
+                                    ),
+                            ),
+                    )
+                    // Right panel: saved connections
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(
+                                v_flex()
+                                    .id("start-connections")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .py_2()
+                                    .children(
+                                        self.connections
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(ix, config)| {
+                                                self.start_connection_row(ix, config, cx)
+                                            }),
+                                    )
+                                    .when(self.connections.is_empty(), |this| {
+                                        this.child(
+                                            div()
+                                                .p_6()
+                                                .text_size(px(12.))
+                                                .text_color(color(COLOR_MUTED))
+                                                .child("No saved connections yet"),
+                                        )
+                                    }),
+                            )
+                            .when(self.show_form, |this| {
+                                this.child(self.render_connection_form(cx))
+                            })
+                            .child(
+                                div()
+                                    .id("start-create-connection")
+                                    .h(px(44.))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .px_5()
+                                    .border_t_1()
+                                    .border_color(border)
+                                    .text_size(px(12.5))
+                                    .text_color(color(COLOR_MUTED))
+                                    .hover(|this| this.text_color(color(COLOR_ACCENT)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_form = !this.show_form;
+                                        cx.notify();
+                                    }))
+                                    .child("Create a new connection…"),
+                            ),
+                    ),
+            )
+    }
+
+    fn start_connection_row(
+        &self,
+        ix: usize,
+        config: &ConnectionConfig,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_active = self.active.as_ref().is_some_and(|a| a.id == config.id);
+        let connected = is_active && self.driver.is_some();
+        let connecting = is_active && self.running && self.driver.is_none();
+        let (badge_letters, badge_color) = Self::engine_badge(&config.database_type);
+        let tag = Self::connection_tag(config);
+        let summary = Self::connection_summary(config);
+        let name = config.name.clone();
+
+        div()
+            .id(SharedString::from(format!("start-conn-{ix}")))
+            .h(px(44.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2p5()
+            .px_4()
+            .when(is_active, |this| this.bg(color(COLOR_HOVER)))
+            .hover(|this| this.bg(color(COLOR_HOVER)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.connect_saved(ix, window, cx)
+            }))
+            .child(
+                div()
+                    .w(px(28.))
+                    .h(px(28.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(color(badge_color))
+                    .text_color(gpui::white())
+                    .text_size(px(10.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(badge_letters),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(name),
+                            )
+                            .when_some(tag, |row, (label, c)| {
+                                row.child(
+                                    div()
+                                        .px_1()
+                                        .rounded(px(3.))
+                                        .flex_shrink_0()
+                                        .text_size(px(9.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .bg(gpui::rgba((c << 8) | 0x29))
+                                        .text_color(color(c))
+                                        .child(label),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_size(px(10.5))
+                            .text_color(color(COLOR_MUTED))
+                            .child(summary),
+                    ),
+            )
+            .when(connected || connecting, |this| {
+                this.child(self.state_dot(if connected {
+                    ConnState::Connected
+                } else {
+                    ConnState::Connecting
+                }))
+            })
+    }
+
     // ---- Toolbar ----
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1297,10 +2237,18 @@ impl Workspace {
                         },
                     ),
             )
+            // Discover other databases on the same server (opens the
+            // switcher popover under the pill).
+            .child(
+                self.glyph_button("switch-db", "⇄", self.db_switch_open)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.discover_databases(window, cx)
+                    })),
+            )
             .child(div().w(px(1.)).h(px(22.)).bg(border).mx_1())
             // Refresh
             .child(
-                self.icon_button("refresh", IconName::RefreshCw, false).on_click(
+                self.glyph_button("refresh", "⟳", false).on_click(
                     cx.listener(|this, _, window, cx| {
                         this.reload_current_table(window, cx);
                     }),
@@ -1316,7 +2264,12 @@ impl Workspace {
                     .child(
                         h_flex()
                             .gap_1()
-                            .child(Icon::new(IconName::Save).xsmall())
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .line_height(px(1.))
+                                    .child("✓"),
+                            )
                             .child("Save"),
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -1332,7 +2285,12 @@ impl Workspace {
                     .child(
                         h_flex()
                             .gap_1()
-                            .child(Icon::new(IconName::Undo2).xsmall())
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .line_height(px(1.))
+                                    .child("↩"),
+                            )
                             .child("Revert"),
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -1347,7 +2305,12 @@ impl Workspace {
                     .child(
                         h_flex()
                             .gap_1()
-                            .child(Icon::new(IconName::Download).xsmall())
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .line_height(px(1.))
+                                    .child("⇓"),
+                            )
                             .child("Export"),
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -1364,12 +2327,15 @@ impl Workspace {
                         h_flex()
                             .gap_1()
                             .child(
-                                Icon::new(match self.safe_mode {
-                                    SafeMode::Off => IconName::ShieldOff,
-                                    _ => IconName::ShieldCheck,
-                                })
-                                .xsmall()
-                                .text_color(self.safe_mode.color()),
+                                div()
+                                    .text_size(px(12.))
+                                    .line_height(px(1.))
+                                    .text_color(self.safe_mode.color())
+                                    .child(match self.safe_mode {
+                                        SafeMode::Off => "○",
+                                        SafeMode::Warn => "◐",
+                                        SafeMode::Strict => "●",
+                                    }),
                             )
                             .child(
                                 div()
@@ -1385,9 +2351,10 @@ impl Workspace {
                     })),
             )
             .child(div().flex_1())
-            // Console toggle
+            // Console toggle — "▄" (lower half block) reads as "bottom
+            // panel", mirroring "◨" for the right inspector.
             .child(
-                self.icon_button("toggle-console", IconName::SquareTerminal, self.show_console)
+                self.glyph_button("toggle-console", "▄", self.show_console)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.show_console = !this.show_console;
                         cx.notify();
@@ -1431,7 +2398,12 @@ impl Workspace {
                         Button::new("add-conn")
                             .ghost()
                             .xsmall()
-                            .child(Icon::new(IconName::Plus))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .line_height(px(1.))
+                                    .child("+"),
+                            )
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.show_form = !this.show_form;
                                 cx.notify();
@@ -1527,6 +2499,7 @@ impl Workspace {
             .flex_shrink_0()
             .min_w_0()
             .h_full()
+            .relative()
             .bg(color(COLOR_SURFACE))
             .border_r_1()
             .border_color(border)
@@ -1696,7 +2669,12 @@ impl Workspace {
                         Button::new("add-table")
                             .ghost()
                             .xsmall()
-                            .child(Icon::new(IconName::Table2))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .line_height(px(1.))
+                                    .child("⊞"),
+                            )
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.new_table_template(window, cx)
                             })),
@@ -1887,7 +2865,12 @@ impl Workspace {
                             .child(
                                 h_flex()
                                     .gap_1()
-                                    .child(Icon::new(IconName::Play).xsmall())
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .line_height(px(1.))
+                                            .child("▶"),
+                                    )
                                     .child("Run ⌘⏎"),
                             )
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -1899,7 +2882,17 @@ impl Workspace {
                             .small()
                             .outline()
                             .disabled(self.running || self.driver.is_none())
-                            .label("Run all")
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .line_height(px(1.))
+                                            .child("▶▶"),
+                                    )
+                                    .child("Run all"),
+                            )
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.run_query(&RunQuery, window, cx)
                             })),
@@ -1940,11 +2933,23 @@ impl Workspace {
                         .into_any_element()
                 } else {
                     div()
+                        .id("grid-data-area")
                         .flex_1()
                         .min_h_0()
                         .overflow_hidden()
                         .bg(color(COLOR_BG))
                         .child(self.table.clone())
+                        .context_menu(|menu, _window, _cx| {
+                            menu.menu("Edit cell", Box::new(EditCell))
+                                .menu("Copy cell", Box::new(CopyCell))
+                                .separator()
+                                .menu("Copy row as JSON", Box::new(CopyRowJson))
+                                .menu("Copy row as YAML", Box::new(CopyRowYaml))
+                                .menu("Copy row as CSV", Box::new(CopyRowCsv))
+                                .separator()
+                                .menu("Insert row", Box::new(InsertRow))
+                                .menu("Delete row", Box::new(DeleteRow))
+                        })
                         .into_any_element()
                 }
             }
@@ -2041,22 +3046,17 @@ impl Workspace {
             .border_color(border)
             .bg(color(COLOR_SURFACE))
             // Data / Structure tabs
-            .child(self.grid_mode_button("grid-data", "Data", GridMode::Data, cx))
-            .child(self.grid_mode_button("grid-structure", "Structure", GridMode::Structure, cx))
+            .child(self.grid_mode_button("grid-data", "▦", "Data", GridMode::Data, cx))
+            .child(self.grid_mode_button(
+                "grid-structure",
+                "☰",
+                "Structure",
+                GridMode::Structure,
+                cx,
+            ))
             .child(div().w(px(1.)).h(px(16.)).bg(color(COLOR_BORDER_SOFT)).mx_1())
-            // Cell edit field + apply
-            .child(div().w(px(220.)).child(Input::new(&self.cell_input).small()))
-            .child(
-                Button::new("apply")
-                    .ghost()
-                    .xsmall()
-                    .label("Apply")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.apply_cell_edit(window, cx)
-                    })),
-            )
-            .child(div().w(px(1.)).h(px(16.)).bg(color(COLOR_BORDER_SOFT)).mx_1())
-            // Row operations
+            // Row operations — cells are edited inline on the grid
+            // (double-click or right-click → Edit cell).
             .child(
                 Button::new("add-row")
                     .ghost()
@@ -2093,6 +3093,7 @@ impl Workspace {
     fn grid_mode_button(
         &self,
         id: &'static str,
+        glyph: &'static str,
         label: &'static str,
         mode: GridMode,
         cx: &mut Context<Self>,
@@ -2103,6 +3104,7 @@ impl Workspace {
             .h(px(20.))
             .flex()
             .items_center()
+            .gap_1()
             .px_2()
             .rounded(px(4.))
             .text_size(px(11.5))
@@ -2110,6 +3112,7 @@ impl Workspace {
             .text_color(if active { color(COLOR_TEXT) } else { color(COLOR_MUTED) })
             .when(active, |this| this.bg(color(COLOR_HOVER)))
             .hover(|this| this.text_color(color(COLOR_TEXT)))
+            .child(glyph)
             .child(label)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.grid_mode = mode;
@@ -2273,10 +3276,20 @@ impl Workspace {
         Button::new(id)
             .ghost()
             .xsmall()
-            .label(format.label())
             .disabled(!has_row)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.copy_row_as(format, cx)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .line_height(px(1.))
+                            .child("⧉"),
+                    )
+                    .child(format.label()),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.copy_row_as(format, window, cx)
             }))
     }
 
@@ -2460,9 +3473,19 @@ impl Workspace {
             .child(Input::new(&self.form.database).small())
             .child(
                 Button::new("connect-form")
-                    .label("Connect")
                     .small()
                     .primary()
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .line_height(px(1.))
+                                    .child("→"),
+                            )
+                            .child("Connect"),
+                    )
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.connect_form(window, cx)
                     })),

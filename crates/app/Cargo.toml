@@ -18,3 +18,9 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+image.workspace = true
+
+[dev-dependencies]
+# Same gpui distribution gpui-kit pins; test-support enables headless UI tests.
+gpui = { package = "gpui-pre", version = "=0.3.8", features = ["test-support"] }
+gpui-kit = { workspace = true, features = ["test-support"] }

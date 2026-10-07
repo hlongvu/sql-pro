@@ -5,9 +5,15 @@
 //! same way, so the delegate here only supplies data and cell rendering,
 //! plus the row visual states (modified/inserted/deleted) that TablePro's
 //! `RowVisualState` carries.
+//!
+//! Inline cell editing: the delegate renders the workspace's cell editor
+//! input directly inside the cell being edited (`editing`), so edits happen
+//! in place on the table. The workspace owns the editor entity and commits
+//! its value on Enter/blur.
 
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
-use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::*;
 use sqlpro_core::value::CellValue;
 
@@ -25,11 +31,21 @@ pub struct ResultsDelegate {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<CellValue>>,
     pub visual: Vec<RowVisual>,
+    /// The cell currently being edited inline, if any.
+    pub editing: Option<(usize, usize)>,
+    /// The shared cell-editor input, rendered inside the editing cell.
+    pub editor: Option<Entity<InputState>>,
 }
 
 impl ResultsDelegate {
     pub fn empty() -> Self {
-        Self { columns: Vec::new(), rows: Vec::new(), visual: Vec::new() }
+        Self {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            visual: Vec::new(),
+            editing: None,
+            editor: None,
+        }
     }
 }
 
@@ -73,21 +89,36 @@ impl TableDelegate for ResultsDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        // The cell being edited renders the editor input in place.
+        if self.editing == Some((row_ix, col_ix)) {
+            if let Some(editor) = self.editor.clone() {
+                return div()
+                    .w_full()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .child(Input::new(&editor).small())
+                    .into_any_element();
+            }
+        }
+
         let Some(row) = self.rows.get(row_ix) else {
-            return div();
+            return div().into_any_element();
         };
         let Some(cell) = row.get(col_ix) else {
-            return div();
+            return div().into_any_element();
         };
         match cell {
             CellValue::Null => div()
                 .text_color(cx.theme().muted_foreground)
                 .italic()
-                .child("NULL"),
+                .child("NULL")
+                .into_any_element(),
             CellValue::Bytes(_) => div()
                 .text_color(cx.theme().muted_foreground)
-                .child("<binary>"),
-            CellValue::Text(_) => div().child(cell.display()),
+                .child("<binary>")
+                .into_any_element(),
+            CellValue::Text(_) => div().child(cell.display()).into_any_element(),
         }
     }
 }

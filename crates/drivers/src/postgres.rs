@@ -289,10 +289,14 @@ fn pg_value_to_cell(
             try_cell!(serde_json::Value, |v: serde_json::Value| CellValue::Text(v.to_string()))
         }
         &Type::BYTEA => try_cell!(Vec<u8>, |v: Vec<u8>| CellValue::Bytes(v)),
+        &Type::UUID => try_cell!(uuid::Uuid, |v: uuid::Uuid| CellValue::Text(v.to_string())),
         &Type::TIMESTAMP => {
             try_cell!(chrono::NaiveDateTime, |v: chrono::NaiveDateTime| CellValue::Text(
                 v.to_string()
             ))
+        }
+        &Type::TIME => {
+            try_cell!(chrono::NaiveTime, |v: chrono::NaiveTime| CellValue::Text(v.to_string()))
         }
         &Type::DATE => try_cell!(chrono::NaiveDate, |v: chrono::NaiveDate| CellValue::Text(
             v.to_string()
@@ -301,6 +305,25 @@ fn pg_value_to_cell(
             chrono::DateTime<chrono::Utc>,
             |v: chrono::DateTime<chrono::Utc>| CellValue::Text(v.to_string())
         ),
+        _ => {}
+    }
+
+    // Enum types (USER-DEFINED) carry their variant name as plain text on
+    // the wire, but tokio-postgres's String only accepts the text-ish OIDs,
+    // so decode them through a permissive wrapper. Text-element arrays get
+    // the same treatment in Postgres's {a,b} rendering.
+    match ty.kind() {
+        tokio_postgres::types::Kind::Enum(_) => {
+            try_cell!(PgEnumText, |v: PgEnumText| CellValue::Text(v.0))
+        }
+        tokio_postgres::types::Kind::Array(elem)
+            if <String as tokio_postgres::types::FromSql>::accepts(elem) =>
+        {
+            try_cell!(Vec<String>, |v: Vec<String>| CellValue::Text(format!(
+                "{{{}}}",
+                v.join(",")
+            )))
+        }
         _ => {}
     }
 
@@ -313,6 +336,24 @@ fn pg_value_to_cell(
 
 fn quote_string(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// A permissive text decoder for enum types: an enum's binary
+/// representation is its variant name as text, but `String` only accepts
+/// the text-ish type OIDs, so enums need their own `FromSql`.
+struct PgEnumText(String);
+
+impl<'a> tokio_postgres::types::FromSql<'a> for PgEnumText {
+    fn from_sql(
+        _: &tokio_postgres::types::Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(PgEnumText(String::from_utf8_lossy(raw).into_owned()))
+    }
+
+    fn accepts(_: &tokio_postgres::types::Type) -> bool {
+        true
+    }
 }
 
 
@@ -404,8 +445,33 @@ impl<'a> tokio_postgres::types::ToSql for PgParam {
                 }
             }
             Type::TIMESTAMP => {
-                if let Ok(v) = chrono::NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S") {
-                    return v.to_sql(ty, out);
+                for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%.f"] {
+                    if let Ok(v) = chrono::NaiveDateTime::parse_from_str(&text, fmt) {
+                        return v.to_sql(ty, out);
+                    }
+                }
+            }
+            Type::TIMESTAMPTZ => {
+                // The grid displays timestamptz as "2026-10-03 05:09:12.947
+                // UTC"; also accept offset and RFC3339 shapes. A value with
+                // no zone is taken as UTC.
+                let normalized = text.replace(" UTC", "+00:00");
+                for fmt in [
+                    "%Y-%m-%d %H:%M:%S%.f%:z",
+                    "%Y-%m-%d %H:%M:%S%:z",
+                    "%Y-%m-%dT%H:%M:%S%.f%:z",
+                    "%+",
+                ] {
+                    if let Ok(v) = chrono::DateTime::<chrono::FixedOffset>::parse_from_str(
+                        &normalized, fmt,
+                    ) {
+                        return v.to_sql(ty, out);
+                    }
+                }
+                for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
+                    if let Ok(v) = chrono::NaiveDateTime::parse_from_str(&text, fmt) {
+                        return v.and_utc().to_sql(ty, out);
+                    }
                 }
             }
             _ => {}
