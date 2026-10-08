@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::menu::ContextMenuExt;
 use gpui_kit::component::notification::Notification;
@@ -28,7 +29,9 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use sqlpro_core::change::{PendingChanges, RowID};
-use sqlpro_core::connection::{validate, ConnectionConfig};
+use sqlpro_core::connection::{
+    parse_connection_url, validate, ConnectionConfig, SslMode, SshAuth, SshTunnelConfig,
+};
 use sqlpro_core::database_type::DatabaseType;
 use sqlpro_core::history::{QueryHistoryEntry, QueryHistoryFilter, QueryHistoryStorage};
 use sqlpro_core::result::QueryResult;
@@ -203,7 +206,6 @@ pub struct Workspace {
     // UI state
     show_inspector: bool,
     show_console: bool,
-    show_form: bool,
     objects_tab: usize,   // 0 = Items, 1 = History
     inspector_tab: usize, // 0 = Details, 1 = Assistant
     grid_mode: GridMode,
@@ -224,15 +226,160 @@ pub struct Workspace {
     /// Inline cell editor: rendered directly inside the cell being edited.
     cell_editor: Entity<InputState>,
     editing_cell: Option<(usize, usize)>,
-    form: ConnectionForm,
+    /// New-connection dialog (engine picker → details form / URL import).
+    pub(crate) dialog_open: bool,
+    pub(crate) dialog: ConnDialog,
+    /// A "Test" from the dialog is in flight (disables the button).
+    conn_testing: bool,
 }
 
-struct ConnectionForm {
-    host: Entity<InputState>,
-    port: Entity<InputState>,
-    user: Entity<InputState>,
-    password: Entity<InputState>,
-    database: Entity<InputState>,
+/// Which screen of the new-connection dialog is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnDialogStep {
+    /// The engine grid (screenshot 1).
+    PickType,
+    /// The connection details form (screenshot 2).
+    Details,
+    /// Paste a connection URL (the "Import from URL" button).
+    ImportUrl,
+}
+
+/// One row of the engine catalog shown in the picker grid. Every entry maps
+/// to a `DatabaseType` id; only some have drivers in this binary.
+struct EngineCatalogEntry {
+    id: &'static str,
+    label: &'static str,
+    letters: &'static str,
+    color: u32,
+}
+
+const ENGINE_CATALOG: &[EngineCatalogEntry] = &[
+    EngineCatalogEntry { id: DatabaseType::POSTGRESQL, label: "PostgreSQL", letters: "Pg", color: 0x3E8ECC },
+    EngineCatalogEntry { id: DatabaseType::MYSQL, label: "MySQL", letters: "Ms", color: 0xE8912D },
+    EngineCatalogEntry { id: "mariadb", label: "MariaDB", letters: "Mr", color: 0x2FA39A },
+    EngineCatalogEntry { id: "mssql", label: "Microsoft SQL Server", letters: "Ss", color: 0x9095A0 },
+    EngineCatalogEntry { id: "cassandra", label: "Cassandra", letters: "Cs", color: 0x3C3F45 },
+    EngineCatalogEntry { id: "mongodb", label: "Mongo (Beta)", letters: "Mg", color: 0x4FA65C },
+    EngineCatalogEntry { id: "snowflake", label: "Snowflake", letters: "Nf", color: 0x35B5E5 },
+    EngineCatalogEntry { id: "redis", label: "Redis", letters: "Re", color: 0xCB4232 },
+    EngineCatalogEntry { id: DatabaseType::SQLITE, label: "SQLite", letters: "Sl", color: 0x8E6EC8 },
+    EngineCatalogEntry { id: "oracle", label: "Oracle", letters: "Oc", color: 0xE8493A },
+    EngineCatalogEntry { id: "cockroachdb", label: "Cockroach", letters: "Cr", color: 0x53A653 },
+    EngineCatalogEntry { id: "vertica", label: "Vertica", letters: "Ve", color: 0x2C5F8A },
+];
+
+/// Status color swatches offered on the details form.
+const STATUS_COLORS: [u32; 6] = [0x6EC878, 0xA06CE8, 0xE8C858, 0x4FC4C4, 0xF08CB8, 0xE85A5A];
+
+fn catalog_entry(db: &DatabaseType) -> Option<&'static EngineCatalogEntry> {
+    ENGINE_CATALOG.iter().find(|e| e.id == db.id())
+}
+
+fn next_ssl_mode(mode: SslMode) -> SslMode {
+    match mode {
+        SslMode::Disable => SslMode::Prefer,
+        SslMode::Prefer => SslMode::Require,
+        SslMode::Require => SslMode::VerifyFull,
+        SslMode::VerifyFull => SslMode::Disable,
+    }
+}
+
+fn ssl_mode_label(mode: SslMode) -> &'static str {
+    match mode {
+        SslMode::Disable => "DISABLED",
+        SslMode::Prefer => "PREFERRED",
+        SslMode::Require => "REQUIRED",
+        SslMode::VerifyFull => "VERIFY FULL",
+    }
+}
+
+/// All inputs of the new-connection dialog. Entities live for the app's
+/// lifetime; `open` resets them so stale values never leak between adds.
+/// Fields are `pub(crate)` so headless tests can drive the dialog.
+pub(crate) struct ConnDialog {
+    pub(crate) step: ConnDialogStep,
+    pub(crate) db_type: DatabaseType,
+    /// Index into ENGINE_CATALOG, None until the user picks one (or a URL
+    /// import sets an engine outside the catalog, e.g. redshift).
+    pub(crate) engine_ix: Option<usize>,
+    pub(crate) color_ix: Option<usize>,
+    pub(crate) store_password: bool,
+    pub(crate) over_ssh: bool,
+    pub(crate) ssl: SslMode,
+    pub(crate) name: Entity<InputState>,
+    pub(crate) tag: Entity<InputState>,
+    pub(crate) host: Entity<InputState>,
+    pub(crate) port: Entity<InputState>,
+    pub(crate) user: Entity<InputState>,
+    pub(crate) password: Entity<InputState>,
+    pub(crate) database: Entity<InputState>,
+    pub(crate) url: Entity<InputState>,
+    pub(crate) ssh_host: Entity<InputState>,
+    pub(crate) ssh_port: Entity<InputState>,
+    pub(crate) ssh_user: Entity<InputState>,
+    pub(crate) ssh_password: Entity<InputState>,
+}
+
+impl ConnDialog {
+    fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
+        Self {
+            step: ConnDialogStep::PickType,
+            db_type: DatabaseType::new(DatabaseType::POSTGRESQL),
+            engine_ix: None,
+            color_ix: None,
+            store_password: true,
+            over_ssh: false,
+            ssl: SslMode::Prefer,
+            name: cx.new(|cx| InputState::new(window, cx).placeholder("My connection")),
+            tag: cx.new(|cx| InputState::new(window, cx).placeholder("local")),
+            host: cx.new(|cx| InputState::new(window, cx).placeholder("127.0.0.1")),
+            port: cx.new(|cx| InputState::new(window, cx).placeholder("5432")),
+            user: cx.new(|cx| InputState::new(window, cx).placeholder("user")),
+            password: cx.new(|cx| InputState::new(window, cx).placeholder("password").masked(true)),
+            database: cx.new(|cx| InputState::new(window, cx).placeholder("database")),
+            url: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("postgresql://user:password@host:5432/database")
+            }),
+            ssh_host: cx.new(|cx| InputState::new(window, cx).placeholder("SSH host")),
+            ssh_port: cx.new(|cx| InputState::new(window, cx).placeholder("22")),
+            ssh_user: cx.new(|cx| InputState::new(window, cx).placeholder("SSH user")),
+            ssh_password: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("SSH password").masked(true)
+            }),
+        }
+    }
+
+    /// Clear everything when the dialog re-opens for a new connection.
+    fn reset(&mut self, window: &mut Window, cx: &mut Context<Workspace>) {
+        self.step = ConnDialogStep::PickType;
+        self.db_type = DatabaseType::new(DatabaseType::POSTGRESQL);
+        self.engine_ix = None;
+        self.color_ix = None;
+        self.store_password = true;
+        self.over_ssh = false;
+        self.ssl = SslMode::Prefer;
+        for input in [
+            &self.name,
+            &self.tag,
+            &self.host,
+            &self.port,
+            &self.user,
+            &self.password,
+            &self.database,
+            &self.url,
+            &self.ssh_host,
+            &self.ssh_port,
+            &self.ssh_user,
+            &self.ssh_password,
+        ] {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+    }
+
+    fn read(cx: &App, input: &Entity<InputState>) -> String {
+        input.read(cx).value().trim().to_string()
+    }
 }
 
 impl Workspace {
@@ -251,13 +398,7 @@ impl Workspace {
             cx.new(|cx| InputState::new(window, cx).placeholder("Search connections"));
         let objects_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search objects"));
         let inspector_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search fields"));
-        let form = ConnectionForm {
-            host: cx.new(|cx| InputState::new(window, cx).placeholder("host (localhost)")),
-            port: cx.new(|cx| InputState::new(window, cx).placeholder("port")),
-            user: cx.new(|cx| InputState::new(window, cx).placeholder("user")),
-            password: cx.new(|cx| InputState::new(window, cx).placeholder("password")),
-            database: cx.new(|cx| InputState::new(window, cx).placeholder("database")),
-        };
+        let dialog = ConnDialog::new(window, cx);
 
         let history =
             QueryHistoryStorage::open(&sqlpro_core::history::default_history_path()).ok();
@@ -295,6 +436,17 @@ impl Workspace {
         })
         .detach();
 
+        // ⏎ in the URL field of the connection dialog applies the import.
+        cx.subscribe_in(&dialog.url, window, |this, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. })
+                && this.dialog_open
+                && this.dialog.step == ConnDialogStep::ImportUrl
+            {
+                this.dialog_apply_url(window, cx);
+            }
+        })
+        .detach();
+
         let history_entries = history
             .as_ref()
             .map(|h| {
@@ -328,7 +480,6 @@ impl Workspace {
             console_log: Vec::new(),
             show_inspector: false,
             show_console: false,
-            show_form: false,
             objects_tab: 0,
             inspector_tab: 0,
             grid_mode: GridMode::Data,
@@ -345,7 +496,9 @@ impl Workspace {
             table,
             cell_editor,
             editing_cell: None,
-            form,
+            dialog_open: false,
+            dialog,
+            conn_testing: false,
         };
 
         // Keyboard shortcuts (⌘S save, ⌘⏎ run, ⌘E/⌘T new query, Escape
@@ -413,11 +566,17 @@ impl Workspace {
     }
 
     fn state_dot(&self, state: ConnState) -> Div {
-        let c = match state {
+        self.colored_dot(state, None)
+    }
+
+    /// The state dot, optionally tinted with the connection's own status
+    /// color (TablePlus colors list rows with the chosen swatch).
+    fn colored_dot(&self, state: ConnState, custom: Option<u32>) -> Div {
+        let c = custom.unwrap_or(match state {
             ConnState::Connected => COLOR_GREEN,
             ConnState::Connecting => COLOR_AMBER,
             ConnState::Offline => COLOR_MUTED,
-        };
+        });
         div().w(px(7.)).h(px(7.)).rounded_full().flex_shrink_0().bg(color(c))
     }
 
@@ -458,46 +617,260 @@ impl Workspace {
         self.connect(Arc::new(config), None, window, cx);
     }
 
-    fn connect_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let read = |e: &Entity<InputState>| e.read(cx).value().trim().to_string();
-        let host = read(&self.form.host);
-        let user = read(&self.form.user);
-        let database = read(&self.form.database);
-        let port: Option<u16> = read(&self.form.port).parse().ok();
-        let password = read(&self.form.password);
+    // ---- New-connection dialog -----------------------------------------
+
+    pub(crate) fn open_conn_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dialog.reset(window, cx);
+        self.dialog_open = true;
+        cx.notify();
+    }
+
+    fn close_conn_dialog(&mut self, cx: &mut Context<Self>) {
+        self.dialog_open = false;
+        cx.notify();
+    }
+
+    /// Test hook: borrow one of the dialog's inputs by field.
+    pub(crate) fn dialog_input(
+        &self,
+        pick: impl Fn(&ConnDialog) -> &Entity<InputState>,
+    ) -> &Entity<InputState> {
+        pick(&self.dialog)
+    }
+
+    pub(crate) fn dialog_pick_engine(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(entry) = ENGINE_CATALOG.get(ix) {
+            self.dialog.engine_ix = Some(ix);
+            self.dialog.db_type = DatabaseType::new(entry.id);
+        }
+        cx.notify();
+    }
+
+    /// The "Create" button on the picker: advance to the details form.
+    pub(crate) fn dialog_advance(&mut self, cx: &mut Context<Self>) {
+        if self.dialog.engine_ix.is_some() {
+            self.dialog.step = ConnDialogStep::Details;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn dialog_apply_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let url = ConnDialog::read(cx, &self.dialog.url);
+        let parsed = match parse_connection_url(&url) {
+            Ok(p) => p,
+            Err(e) => {
+                self.toast(Notification::error(e).title("Import from URL"), window, cx);
+                return;
+            }
+        };
+        let mut set = |input: &Entity<InputState>, value: &str, cx: &mut App| {
+            input.update(cx, |state, cx| state.set_value(value, window, cx));
+        };
+        set(&self.dialog.host, parsed.host.as_deref().unwrap_or(""), cx);
+        set(
+            &self.dialog.port,
+            &parsed.port.map(|p| p.to_string()).unwrap_or_default(),
+            cx,
+        );
+        set(&self.dialog.user, parsed.username.as_deref().unwrap_or(""), cx);
+        set(&self.dialog.password, parsed.password.as_deref().unwrap_or(""), cx);
+        set(&self.dialog.database, parsed.database.as_deref().unwrap_or(""), cx);
+        if let Some(ssl) = parsed.ssl_mode {
+            self.dialog.ssl = ssl;
+        }
+        self.dialog.db_type = parsed.database_type.clone();
+        self.dialog.engine_ix = catalog_entry(&parsed.database_type).map(|e| {
+            ENGINE_CATALOG
+                .iter()
+                .position(|entry| entry.id == e.id)
+                .unwrap_or(0)
+        });
+        self.dialog.step = ConnDialogStep::Details;
+        let engine = catalog_entry(&parsed.database_type)
+            .map(|e| e.label.to_string())
+            .unwrap_or_else(|| parsed.database_type.to_string());
+        self.log_console(true, "import url", &format!("{engine} {url}"));
+        self.toast(
+            Notification::success(format!("Parsed {engine} connection URL")),
+            window,
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Read the dialog inputs into a `ConnectionConfig` (nothing persisted).
+    pub(crate) fn dialog_build_config(
+        &self,
+        cx: &App,
+    ) -> std::result::Result<ConnectionConfig, String> {
+        let is_sqlite = self.dialog.db_type.driver_id() == "sqlite";
+        let host = ConnDialog::read(cx, &self.dialog.host);
+        let database = ConnDialog::read(cx, &self.dialog.database);
+        let port: Option<u16> = ConnDialog::read(cx, &self.dialog.port).parse().ok();
+        let user = ConnDialog::read(cx, &self.dialog.user);
+        let password = ConnDialog::read(cx, &self.dialog.password);
+        let name_input = ConnDialog::read(cx, &self.dialog.name);
 
         let mut config = ConnectionConfig::new(
-            format!(
-                "{}:{}/{}",
-                if host.is_empty() { "localhost" } else { &host },
-                port.unwrap_or(5432),
-                database
-            ),
-            DatabaseType::new(DatabaseType::POSTGRESQL),
+            "pending",
+            self.dialog.db_type.clone(),
         );
-        config.host = Some(if host.is_empty() { "localhost".into() } else { host });
-        config.port = port;
-        config.username = Some(if user.is_empty() { whoami_fallback() } else { user });
-        config.password = Some(password);
-        config.database = Some(database);
+        if is_sqlite {
+            config.path = (!database.is_empty()).then_some(database.clone());
+            if name_input.is_empty() {
+                let file = database.rsplit('/').next().unwrap_or("SQLite");
+                config.name = format!("SQLite · {file}");
+            }
+        } else {
+            if host.is_empty() {
+                return Err("Host is required".into());
+            }
+            config.host = Some(host.clone());
+            config.port = port;
+            config.username = (!user.is_empty()).then_some(user.clone());
+            config.password = (!password.is_empty()).then_some(password);
+            config.database = (!database.is_empty()).then_some(database.clone());
+            config.ssl_mode = self.dialog.ssl;
+        }
+        if name_input.is_empty() && !is_sqlite {
+            config.name = format!(
+                "{}:{}{}",
+                host,
+                port.or_else(|| config.database_type.default_port()).unwrap_or(0),
+                if database.is_empty() {
+                    String::new()
+                } else {
+                    format!("/{database}")
+                }
+            );
+        } else if !name_input.is_empty() {
+            config.name = name_input;
+        }
+        config.color = self.dialog.color_ix.map(|ix| STATUS_COLORS[ix]);
+        let tag = ConnDialog::read(cx, &self.dialog.tag);
+        config.tag = (!tag.is_empty()).then_some(tag);
 
-        if let Err(e) = validate(&config) {
-            self.status = format!("Invalid connection: {e}");
-            self.log_console(false, "connect", &e.to_string());
+        if self.dialog.over_ssh {
+            let ssh_host = ConnDialog::read(cx, &self.dialog.ssh_host);
+            if ssh_host.is_empty() {
+                return Err("SSH host is required when Over SSH is on".into());
+            }
+            config.ssh_tunnel = Some(SshTunnelConfig {
+                host: ssh_host,
+                port: ConnDialog::read(cx, &self.dialog.ssh_port)
+                    .parse()
+                    .unwrap_or(22),
+                username: {
+                    let u = ConnDialog::read(cx, &self.dialog.ssh_user);
+                    if u.is_empty() { whoami_fallback() } else { u }
+                },
+                auth: SshAuth::Password {
+                    password: ConnDialog::read(cx, &self.dialog.ssh_password),
+                },
+            });
+        }
+
+        validate(&config).map_err(|e| e.to_string())?;
+        Ok(config)
+    }
+
+    /// Persist the dialog's connection without opening it.
+    fn dialog_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut config = match self.dialog_build_config(cx) {
+            Ok(c) => c,
+            Err(e) => {
+                self.toast(Notification::error(e).title("Invalid connection"), window, cx);
+                return;
+            }
+        };
+        if !self.dialog.store_password {
+            config.password = None;
+        }
+        let name = config.name.clone();
+        self.connections.push(config);
+        store::save_connections(&self.connections);
+        self.log_console(true, "save connection", &name);
+        self.toast(
+            Notification::success(format!("Saved connection {name}")),
+            window,
+            cx,
+        );
+        self.close_conn_dialog(cx);
+    }
+
+    /// Try opening the connection, then report — never touches workspace
+    /// state, the driver is dropped right after (which closes the session).
+    fn dialog_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.conn_testing {
+            return;
+        }
+        let config = match self.dialog_build_config(cx) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                self.toast(Notification::error(e).title("Invalid connection"), window, cx);
+                return;
+            }
+        };
+        self.conn_testing = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let cfg = Arc::clone(&config);
+            let outcome = sqlpro_drivers::runtime::on_thread(move || {
+                sqlpro_drivers::create_driver(&cfg).map(|driver| driver.label().to_string())
+            })
+            .await;
+            // The Box is dropped at the end of on_thread's task: closed.
+            let msg = match outcome {
+                Ok(label) => Ok(label),
+                Err(e) => Err(e.to_string()),
+            };
+            _ = this.update_in(cx, |ws, window, cx| {
+                ws.conn_testing = false;
+                match msg {
+                    Ok(label) => ws.toast(
+                        Notification::success(format!("Test succeeded: {label}"))
+                            .title("Connection test"),
+                        window,
+                        cx,
+                    ),
+                    Err(e) => ws.toast(
+                        Notification::error(e).title("Connection test failed"),
+                        window,
+                        cx,
+                    ),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Save the connection and open it.
+    fn dialog_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let config = match self.dialog_build_config(cx) {
+            Ok(c) => c,
+            Err(e) => {
+                self.toast(Notification::error(e).title("Invalid connection"), window, cx);
+                return;
+            }
+        };
+        if self.running {
             self.toast(
-                Notification::error(e.to_string()).title("Invalid connection"),
+                Notification::warning("Busy — wait for the current operation"),
                 window,
                 cx,
             );
-            cx.notify();
             return;
         }
-
-        if !self.connections.iter().any(|c| c.id == config.id) {
-            self.connections.push(config.clone());
-            store::save_connections(&self.connections);
+        // What lands on disk respects "Store in keychain": without it the
+        // password stays only in the in-memory config for this connect.
+        let mut saved = config.clone();
+        if !self.dialog.store_password {
+            saved.password = None;
         }
-        self.show_form = false;
+        self.connections.push(saved);
+        store::save_connections(&self.connections);
+        self.close_conn_dialog(cx);
         self.connect(Arc::new(config), None, window, cx);
     }
 
@@ -1568,6 +1941,9 @@ impl Workspace {
     }
 
     fn engine_label(db: &DatabaseType) -> &'static str {
+        if let Some(entry) = catalog_entry(db) {
+            return entry.label;
+        }
         match db.driver_id() {
             "postgresql" => "PostgreSQL",
             "mysql" => "MySQL",
@@ -1578,6 +1954,9 @@ impl Workspace {
 
     /// The circular engine badge on the start screen: letters + color.
     fn engine_badge(db: &DatabaseType) -> (&'static str, u32) {
+        if let Some(entry) = catalog_entry(db) {
+            return (entry.letters, entry.color);
+        }
         match db.driver_id() {
             "postgresql" => ("Pg", 0x2F7CF6),
             "mysql" => ("My", 0xE68A2E),
@@ -1586,16 +1965,19 @@ impl Workspace {
         }
     }
 
-    /// A small environment chip for a connection ("local", "demo", …).
-    fn connection_tag(config: &ConnectionConfig) -> Option<(&'static str, u32)> {
+    /// A small environment chip for a connection. An explicit tag set in
+    /// the dialog wins; otherwise derive one ("demo", "local", "remote").
+    fn connection_tag(config: &ConnectionConfig) -> Option<(String, u32)> {
+        if let Some(tag) = &config.tag {
+            return Some((tag.clone(), 0x8957E5));
+        }
         if config.name.contains("Demo") {
-            Some(("demo", 0x8957E5))
-        } else if matches!(config.host.as_deref(), Some("127.0.0.1") | Some("localhost")) {
-            Some(("local", 0x3FB950))
-        } else if config.host.is_some() {
-            Some(("remote", 0x2F7CF6))
-        } else {
-            None
+            return Some(("demo".into(), 0x8957E5));
+        }
+        match config.host.as_deref() {
+            Some("127.0.0.1") | Some("localhost") => Some(("local".into(), 0x3FB950)),
+            Some(_) => Some(("remote".into(), 0x2F7CF6)),
+            None => None,
         }
     }
 
@@ -1691,7 +2073,9 @@ impl Render for Workspace {
                             ws.new_query(window, ws_cx);
                         }),
                         ("escape", false) => entity.update(cx, |ws, ws_cx| {
-                            if ws.db_switch_open {
+                            if ws.dialog_open {
+                                ws.close_conn_dialog(ws_cx);
+                            } else if ws.db_switch_open {
                                 ws.db_switch_open = false;
                                 ws_cx.notify();
                             } else {
@@ -1889,6 +2273,10 @@ impl Render for Workspace {
                         })),
                 )
             })
+            // New-connection dialog paints over everything.
+            .when(self.dialog_open, |root| {
+                root.child(self.conn_dialog_overlay(cx))
+            })
             .into_any_element()
     }
 }
@@ -1921,6 +2309,20 @@ impl Workspace {
             .bg(color(COLOR_BG))
             .text_color(color(COLOR_TEXT))
             .text_size(px(13.))
+            // Escape dismisses the connection dialog from the welcome screen
+            // (the workspace root handles it once connected).
+            .on_key_down({
+                let entity = cx.entity();
+                move |event: &KeyDownEvent, _: &mut Window, cx: &mut App| {
+                    if event.keystroke.key.to_lowercase() == "escape" {
+                        entity.update(cx, |ws, cx| {
+                            if ws.dialog_open {
+                                ws.close_conn_dialog(cx);
+                            }
+                        });
+                    }
+                }
+            })
             .child(
                 h_flex()
                     .w(px(680.))
@@ -1995,9 +2397,8 @@ impl Workspace {
                                                     )
                                                     .child("Connection"),
                                             )
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.show_form = true;
-                                                cx.notify();
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.open_conn_dialog(window, cx)
                                             })),
                                     )
                                     .child(
@@ -2053,9 +2454,6 @@ impl Workspace {
                                         )
                                     }),
                             )
-                            .when(self.show_form, |this| {
-                                this.child(self.render_connection_form(cx))
-                            })
                             .child(
                                 div()
                                     .id("start-create-connection")
@@ -2069,14 +2467,17 @@ impl Workspace {
                                     .text_size(px(12.5))
                                     .text_color(color(COLOR_MUTED))
                                     .hover(|this| this.text_color(color(COLOR_ACCENT)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.show_form = !this.show_form;
-                                        cx.notify();
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_conn_dialog(window, cx)
                                     }))
                                     .child("Create a new connection…"),
                             ),
                     ),
             )
+            // The connection dialog paints over the welcome card.
+            .when(self.dialog_open, |root| {
+                root.child(self.conn_dialog_overlay(cx))
+            })
     }
 
     fn start_connection_row(
@@ -2165,11 +2566,14 @@ impl Workspace {
                     ),
             )
             .when(connected || connecting, |this| {
-                this.child(self.state_dot(if connected {
-                    ConnState::Connected
-                } else {
-                    ConnState::Connecting
-                }))
+                this.child(self.colored_dot(
+                    if connected {
+                        ConnState::Connected
+                    } else {
+                        ConnState::Connecting
+                    },
+                    config.color,
+                ))
             })
     }
 
@@ -2404,9 +2808,8 @@ impl Workspace {
                                     .line_height(px(1.))
                                     .child("+"),
                             )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.show_form = !this.show_form;
-                                cx.notify();
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_conn_dialog(window, cx)
                             })),
                     ),
             )
@@ -2440,11 +2843,14 @@ impl Workspace {
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.connect_saved(ix, window, cx)
                             }))
-                            .child(self.state_dot(if is_active {
-                                ConnState::Connected
-                            } else {
-                                ConnState::Offline
-                            }))
+                            .child(self.colored_dot(
+                                if is_active {
+                                    ConnState::Connected
+                                } else {
+                                    ConnState::Offline
+                                },
+                                config.color,
+                            ))
                             .child(
                                 v_flex()
                                     .flex_1()
@@ -2483,7 +2889,6 @@ impl Workspace {
                             )
                     })),
             )
-            .when(self.show_form, |this| this.child(self.render_connection_form(cx)))
     }
 
     // ---- Pane 2: tables & objects ----
@@ -3447,48 +3852,710 @@ impl Workspace {
         }
     }
 
-    // ---- New connection form (collapsed by default) ----
+    // ---- New-connection dialog rendering --------------------------------
 
-    fn render_connection_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The modal overlay: dimmed backdrop (click to cancel) with the dialog
+    /// card centered on top. Painted last on both the welcome screen and the
+    /// workspace root, so it floats over either.
+    fn conn_dialog_overlay(&self, cx: &mut Context<Self>) -> Div {
+        div().absolute().inset_0().child(
+            div()
+                .id("conn-dialog-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x00000059))
+                .on_click(cx.listener(|this, _, _, cx| this.close_conn_dialog(cx))),
+        )
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(match self.dialog.step {
+                    ConnDialogStep::PickType => self.render_engine_picker(cx).into_any_element(),
+                    ConnDialogStep::Details => self.render_conn_details(cx).into_any_element(),
+                    ConnDialogStep::ImportUrl => self.render_url_import(cx).into_any_element(),
+                }),
+        )
+    }
+
+    /// A right-aligned form label for the details rows.
+    fn dialog_label(text: &str) -> Div {
+        div()
+            .w(px(92.))
+            .flex_shrink_0()
+            .text_right()
+            .text_size(px(12.))
+            .text_color(color(COLOR_MUTED))
+            .child(text.to_string())
+    }
+
+    /// Step 1 — the engine grid: circular badges in a 4×3 catalog, Cancel /
+    /// Import from URL / Create in the footer (screenshot 1).
+    fn render_engine_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let border = color(COLOR_BORDER);
+        let selected = self.dialog.engine_ix;
+
+        let mut grid = v_flex().gap_1p5();
+        for (row_ix, row) in ENGINE_CATALOG.chunks(4).enumerate() {
+            let cell_list: Vec<_> = row
+                .iter()
+                .enumerate()
+                .map(|(col_ix, entry)| {
+                    let ix = row_ix * 4 + col_ix;
+                    let is_selected = selected == Some(ix);
+                    v_flex()
+                        .id(SharedString::from(format!("engine-{}", entry.id)))
+                        .w(px(108.))
+                        .h(px(84.))
+                        .flex_shrink_0()
+                        .items_center()
+                        .justify_center()
+                        .gap_1p5()
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(if is_selected {
+                            color(COLOR_ACCENT)
+                        } else {
+                            gpui::hsla(0., 0., 0., 0.)
+                        })
+                        .when(is_selected, |cell| cell.bg(color(COLOR_HOVER)))
+                        .hover(|cell| cell.bg(color(COLOR_HOVER)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.dialog_pick_engine(ix, cx)
+                        }))
+                        .child(
+                            div()
+                                .w(px(38.))
+                                .h(px(38.))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(gpui::rgb(entry.color))
+                                .text_color(gpui::white())
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(entry.letters),
+                        )
+                        .child(
+                            div()
+                                .max_w(px(96.))
+                                .text_align(TextAlign::Center)
+                                .text_size(px(10.5))
+                                .line_height(px(1.25))
+                                .text_color(color(COLOR_TEXT))
+                                .child(entry.label),
+                        )
+                })
+                .collect();
+            grid = grid.child(h_flex().gap_1p5().children(cell_list));
+        }
 
         v_flex()
-            .flex_shrink_0()
-            .px_3()
-            .py_2()
-            .gap_1()
-            .border_t_1()
+            .w(px(476.))
+            .rounded(px(10.))
+            .border_1()
             .border_color(border)
-            .bg(color(COLOR_SURFACE2))
+            .bg(color(COLOR_SURFACE))
+            .shadow_lg()
+            .overflow_hidden()
             .child(
-                div()
-                    .text_size(px(10.))
-                    .text_color(color(COLOR_MUTED))
-                    .child("NEW POSTGRESQL CONNECTION"),
+                v_flex()
+                    .p_4()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(color(COLOR_MUTED))
+                            .child("CHOOSE A DATABASE TYPE"),
+                    )
+                    .child(grid),
             )
-            .child(Input::new(&self.form.host).small())
-            .child(Input::new(&self.form.port).small())
-            .child(Input::new(&self.form.user).small())
-            .child(Input::new(&self.form.password).small())
-            .child(Input::new(&self.form.database).small())
             .child(
-                Button::new("connect-form")
-                    .small()
-                    .primary()
+                h_flex()
+                    .justify_between()
+                    .px_4()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(border)
+                    .bg(color(COLOR_SURFACE2))
+                    .child(
+                        Button::new("dialog-cancel")
+                            .small()
+                            .ghost()
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        div().text_size(px(12.)).line_height(px(1.)).child("✕"),
+                                    )
+                                    .child("Cancel"),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_conn_dialog(cx)
+                            })),
+                    )
                     .child(
                         h_flex()
-                            .gap_1()
+                            .gap_2()
+                            .child(
+                                Button::new("dialog-import-url")
+                                    .small()
+                                    .outline()
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_size(px(12.))
+                                                    .line_height(px(1.))
+                                                    .child("⇩"),
+                                            )
+                                            .child("Import from URL"),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.dialog.step = ConnDialogStep::ImportUrl;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("dialog-create")
+                                    .small()
+                                    .primary()
+                                    .disabled(self.dialog.engine_ix.is_none())
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_size(px(12.))
+                                                    .line_height(px(1.))
+                                                    .child("+"),
+                                            )
+                                            .child("Create"),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.dialog_advance(cx)
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    /// Step 2 — the details form (screenshot 2): name, status color + tag,
+    /// host/port, user, password (+ store in keychain), database, SSL,
+    /// optional SSH section, footer Save / Test / Connect.
+    fn render_conn_details(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = color(COLOR_BORDER);
+        let is_sqlite = self.dialog.db_type.driver_id() == "sqlite";
+        let engine_label = catalog_entry(&self.dialog.db_type)
+            .map(|e| e.label.to_string())
+            .unwrap_or_else(|| self.dialog.db_type.to_string());
+        let port_hint = self
+            .dialog
+            .db_type
+            .default_port()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "port".into());
+        let has_driver = self.dialog.db_type.is_builtin();
+
+        let mut body = v_flex().p_4().gap_2();
+
+        // Name
+        body = body.child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(Self::dialog_label("Name"))
+                .child(Input::new(&self.dialog.name).small().flex_1()),
+        );
+
+        // Status color + tag
+        let swatch_list: Vec<_> = STATUS_COLORS
+            .iter()
+            .enumerate()
+            .map(|(ix, swatch)| {
+                let selected = self.dialog.color_ix == Some(ix);
+                div()
+                    .id(SharedString::from(format!("status-color-{ix}")))
+                    .w(px(16.))
+                    .h(px(16.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .bg(gpui::rgb(*swatch))
+                    .border_2()
+                    .border_color(if selected {
+                        color(COLOR_TEXT)
+                    } else {
+                        gpui::hsla(0., 0., 0., 0.)
+                    })
+                    .hover(|this| this.border_color(color(COLOR_MUTED)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.dialog.color_ix = if this.dialog.color_ix == Some(ix) {
+                            None
+                        } else {
+                            Some(ix)
+                        };
+                        cx.notify();
+                    }))
+            })
+            .collect();
+        body = body.child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(Self::dialog_label("Status color"))
+                .child(h_flex().gap_1p5().children(swatch_list))
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(color(COLOR_MUTED))
+                        .child("Tag"),
+                )
+                .child(Input::new(&self.dialog.tag).small().w(px(140.))),
+        );
+
+        // Host + port (TCP engines only)
+        if !is_sqlite {
+            body = body.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Self::dialog_label("Host"))
+                    .child(Input::new(&self.dialog.host).small().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(color(COLOR_MUTED))
+                            .child("Port"),
+                    )
+                    .child(Input::new(&self.dialog.port).small().w(px(96.)))
+                    .child(
+                        div()
+                            .w(px(16.))
+                            .text_size(px(10.5))
+                            .text_color(color(COLOR_MUTED))
+                            .child(port_hint.clone()),
+                    ),
+            );
+
+            // User
+            body = body.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Self::dialog_label("User"))
+                    .child(Input::new(&self.dialog.user).small().flex_1()),
+            );
+
+            // Password + store in keychain
+            body = body.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Self::dialog_label("Password"))
+                    .child(
+                        Input::new(&self.dialog.password)
+                            .small()
+                            .mask_toggle()
+                            .flex_1(),
+                    )
+                    .child(
+                        Checkbox::new("store-in-keychain")
+                            .label("Store in keychain")
+                            .checked(self.dialog.store_password)
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.dialog.store_password = *checked;
+                                cx.notify();
+                            })),
+                    ),
+            );
+
+            // Database
+            body = body.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Self::dialog_label("Database"))
+                    .child(Input::new(&self.dialog.database).small().flex_1()),
+            );
+
+            // SSL mode
+            body = body.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Self::dialog_label("SSL mode"))
+                    .child(
+                        Button::new("ssl-mode")
+                            .small()
+                            .outline()
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .line_height(px(1.))
+                                            .child(ssl_mode_label(self.dialog.ssl)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .line_height(px(1.))
+                                            .text_color(color(COLOR_MUTED))
+                                            .child("▾"),
+                                    ),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.dialog.ssl = next_ssl_mode(this.dialog.ssl);
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().flex_1()),
+            );
+
+            // SSL keys (certificate files land in a later milestone)
+            let ssl_key_button = |id: &'static str, label: &'static str| {
+                Button::new(id)
+                    .small()
+                    .outline()
+                    .child(label)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toast(
+                            Notification::warning(
+                                "SSL certificate files aren't supported yet",
+                            )
+                            .title("SSL keys"),
+                            window,
+                            cx,
+                        );
+                    }))
+            };
+            body = body.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Self::dialog_label("SSL keys"))
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .child(ssl_key_button("ssl-key", "Key…"))
+                            .child(ssl_key_button("ssl-cert", "Cert…"))
+                            .child(ssl_key_button("ssl-ca", "CA Cert…")),
+                    )
+                    .child(div().flex_1()),
+            );
+        } else {
+            // SQLite: a file path (or :memory:) instead of TCP fields.
+            body = body.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Self::dialog_label("File"))
+                    .child(Input::new(&self.dialog.database).small().flex_1())
+                    .child(
+                        div()
+                            .w(px(140.))
+                            .text_size(px(10.5))
+                            .text_color(color(COLOR_MUTED))
+                            .child("path or :memory:"),
+                    ),
+            );
+        }
+
+        // Engines without a driver in this binary: say so up front.
+        if !has_driver {
+            body = body.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(color(COLOR_AMBER))
+                    .child(format!(
+                        "No driver installed for {engine_label} yet — the connection can be saved, but Test/Connect will fail."
+                    )),
+            );
+        }
+
+        // Optional SSH tunnel section
+        if self.dialog.over_ssh {
+            body = body.child(
+                v_flex()
+                    .gap_2()
+                    .pt_1()
+                    .mt_1()
+                    .border_t_1()
+                    .border_color(color(COLOR_BORDER_SOFT))
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(color(COLOR_MUTED))
+                            .child("OVER SSH"),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Self::dialog_label("SSH host"))
+                            .child(Input::new(&self.dialog.ssh_host).small().flex_1())
                             .child(
                                 div()
-                                    .text_size(px(11.))
-                                    .line_height(px(1.))
-                                    .child("→"),
+                                    .text_size(px(12.))
+                                    .text_color(color(COLOR_MUTED))
+                                    .child("Port"),
                             )
-                            .child("Connect"),
+                            .child(Input::new(&self.dialog.ssh_port).small().w(px(96.))),
                     )
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.connect_form(window, cx)
-                    })),
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Self::dialog_label("SSH user"))
+                            .child(Input::new(&self.dialog.ssh_user).small().flex_1()),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Self::dialog_label("SSH password"))
+                            .child(Input::new(&self.dialog.ssh_password).small().flex_1()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(color(COLOR_MUTED))
+                            .child(
+                                "The tunnel is stored with the connection; opening it lands in a later milestone.",
+                            ),
+                    ),
+            );
+        }
+
+        v_flex()
+            .id("conn-details-card")
+            .w(px(560.))
+            .max_h(px(620.))
+            .overflow_y_scroll()
+            .rounded(px(10.))
+            .border_1()
+            .border_color(border)
+            .bg(color(COLOR_SURFACE))
+            .shadow_lg()
+            // Header: red close dot + centered title, TablePlus-style.
+            .child(
+                h_flex()
+                    .h(px(40.))
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_center()
+                    .border_b_1()
+                    .border_color(border)
+                    .relative()
+                    .child(
+                        div()
+                            .id("dialog-close-dot")
+                            .absolute()
+                            .left(px(14.))
+                            .top(px(14.))
+                            .w(px(12.))
+                            .h(px(12.))
+                            .rounded_full()
+                            .bg(color(COLOR_RED))
+                            .hover(|this| this.opacity(0.8))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_conn_dialog(cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(format!("{engine_label} Connection")),
+                    ),
+            )
+            .child(body)
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .gap_2()
+                    .px_4()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(border)
+                    .bg(color(COLOR_SURFACE2))
+                    .child(
+                        Button::new("dialog-over-ssh")
+                            .small()
+                            .outline()
+                            .when(self.dialog.over_ssh, |b| b.primary())
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        div().text_size(px(12.)).line_height(px(1.)).child("⇄"),
+                                    )
+                                    .child("Over SSH"),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.dialog.over_ssh = !this.dialog.over_ssh;
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("dialog-save")
+                            .small()
+                            .outline()
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        div().text_size(px(12.)).line_height(px(1.)).child("✓"),
+                                    )
+                                    .child("Save"),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dialog_save(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("dialog-test")
+                            .small()
+                            .outline()
+                            .disabled(self.conn_testing)
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        div().text_size(px(12.)).line_height(px(1.)).child("⚡"),
+                                    )
+                                    .child(if self.conn_testing { "Testing…" } else { "Test" }),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dialog_test(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("dialog-connect")
+                            .small()
+                            .primary()
+                            .disabled(self.running)
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        div().text_size(px(12.)).line_height(px(1.)).child("→"),
+                                    )
+                                    .child("Connect"),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dialog_connect(window, cx)
+                            })),
+                    ),
+            )
+    }
+
+    /// The "Import from URL" screen: paste a connection string, ⏎ or the
+    /// button parses it and continues to the details form.
+    fn render_url_import(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = color(COLOR_BORDER);
+        v_flex()
+            .w(px(520.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(border)
+            .bg(color(COLOR_SURFACE))
+            .shadow_lg()
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .h(px(40.))
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_center()
+                    .border_b_1()
+                    .border_color(border)
+                    .relative()
+                    .child(
+                        div()
+                            .id("url-close-dot")
+                            .absolute()
+                            .left(px(14.))
+                            .top(px(14.))
+                            .w(px(12.))
+                            .h(px(12.))
+                            .rounded_full()
+                            .bg(color(COLOR_RED))
+                            .hover(|this| this.opacity(0.8))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_conn_dialog(cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Import from URL"),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .p_4()
+                    .gap_2()
+                    .child(Input::new(&self.dialog.url).small())
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(color(COLOR_MUTED))
+                            .child(
+                                "The scheme picks the engine: postgresql, mysql, mariadb, sqlite, mssql, mongodb, redis, cassandra, snowflake, oracle, vertica, cockroach…",
+                            ),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .justify_between()
+                    .px_4()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(border)
+                    .bg(color(COLOR_SURFACE2))
+                    .child(
+                        Button::new("url-back")
+                            .small()
+                            .ghost()
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        div().text_size(px(12.)).line_height(px(1.)).child("←"),
+                                    )
+                                    .child("Back"),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.dialog.step = ConnDialogStep::PickType;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("url-apply")
+                            .small()
+                            .primary()
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        div().text_size(px(12.)).line_height(px(1.)).child("⇩"),
+                                    )
+                                    .child("Parse & Continue"),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dialog_apply_url(window, cx)
+                            })),
+                    ),
             )
     }
 }

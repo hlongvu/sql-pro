@@ -42,6 +42,20 @@ impl DatabaseType {
 
     /// Default TCP port for the engine, if it has one.
     pub fn default_port(&self) -> Option<u16> {
+        // Protocol-compatible aliases first: cockroach/redshift are PG
+        // wire-compatible but listen on their own ports.
+        match self.id() {
+            "cockroachdb" => return Some(26257),
+            "redshift" => return Some(5439),
+            "mssql" => return Some(1433),
+            "cassandra" => return Some(9042),
+            "mongodb" => return Some(27017),
+            "snowflake" => return Some(443),
+            "redis" => return Some(6379),
+            "oracle" => return Some(1521),
+            "vertica" => return Some(5433),
+            _ => {}
+        }
         match self.driver_id() {
             "postgresql" => Some(5432),
             "mysql" => Some(3306),

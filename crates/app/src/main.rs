@@ -13,6 +13,8 @@ mod theme;
 mod workspace;
 
 #[cfg(test)]
+mod conn_dialog_tests;
+#[cfg(test)]
 mod toast_tests;
 
 // The prelude brings gpui's `AppContext`/element builders into scope. The

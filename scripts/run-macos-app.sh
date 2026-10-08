@@ -34,4 +34,6 @@ iconutil --convert icns "$iconset_dir" --output "$resources_dir/sql-pro.icns"
 cp "$project_root/crates/app/macos/Info.plist" "$app_bundle/Contents/Info.plist"
 cp "$binary_dir/sqlpro" "$app_bundle/Contents/MacOS/sqlpro"
 
-open "$app_bundle"
+if [[ "${SQLPRO_OPEN_APP:-1}" == "1" ]]; then
+    open "$app_bundle"
+fi
