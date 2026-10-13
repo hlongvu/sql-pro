@@ -2209,6 +2209,8 @@ impl Render for Workspace {
                 .child(
                     v_flex()
                         .id("db-switch-menu")
+                        // Rows must not also fire the backdrop's close.
+                        .occlude()
                         .absolute()
                         .left(px(12.))
                         .top(px(52.))
@@ -3956,6 +3958,9 @@ impl Workspace {
 
         v_flex()
             .w(px(476.))
+            // Clicks inside the card must not reach the close-on-click
+            // backdrop behind it (gpui dispatches to every hovered hitbox).
+            .occlude()
             .rounded(px(10.))
             .border_1()
             .border_color(border)
@@ -4336,6 +4341,8 @@ impl Workspace {
 
         v_flex()
             .id("conn-details-card")
+            // Occlude the backdrop so form clicks don't dismiss the dialog.
+            .occlude()
             .w(px(560.))
             .max_h(px(620.))
             .overflow_y_scroll()
@@ -4464,6 +4471,7 @@ impl Workspace {
         let border = color(COLOR_BORDER);
         v_flex()
             .w(px(520.))
+            .occlude()
             .rounded(px(10.))
             .border_1()
             .border_color(border)

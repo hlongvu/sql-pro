@@ -4,12 +4,42 @@
 //! Declared from the crate root (sibling of `workspace`, not a child) for
 //! the same `#[gpui::test]` self-alias reason as `toast_tests`.
 
-use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowHandle};
+use gpui::{
+    AnyWindowHandle, AppContext, Entity, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point,
+    PlatformInput, TestAppContext, WindowHandle,
+};
 use gpui_kit::component::input::InputState;
 
 use crate::workspace::{ConnDialog, ConnDialogStep, Workspace};
 
 type RootHandle = WindowHandle<gpui_kit::base::Root>;
+
+/// Dispatch a real left click at `position` through the window's event
+/// pipeline (updates the mouse position, rebuilds the hit-test, runs the
+/// down/up listeners).
+fn simulate_click(window: &mut gpui::Window, cx: &mut gpui::App, position: Point<Pixels>) {
+    window
+        .dispatch_event(
+            PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+    window
+        .dispatch_event(
+            PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+            }),
+            cx,
+        );
+}
 
 fn open_workspace(cx: &mut TestAppContext) -> (RootHandle, Entity<Workspace>) {
     cx.update(|cx| {
@@ -228,4 +258,59 @@ fn every_dialog_step_draws(cx: &mut TestAppContext) {
             window.draw(cx);
         })
         .unwrap();
+}
+
+#[gpui::test]
+fn clicking_inside_the_dialog_card_does_not_dismiss_it(cx: &mut TestAppContext) {
+    let (handle, ws) = open_workspace(cx);
+    AnyWindowHandle::from(*handle)
+        .update(cx, |_, window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.open_conn_dialog(window, cx);
+            });
+            window.draw(cx);
+
+            // The card is centered, so the viewport center lands on it.
+            let size = window.viewport_size();
+            simulate_click(
+                window,
+                cx,
+                Point::new(size.width / 2.0, size.height / 2.0),
+            );
+            window.draw(cx);
+
+            let ws = ws.read(cx);
+            assert!(
+                ws.dialog_open,
+                "a click inside the card must never reach the close-on-click backdrop"
+            );
+            assert_eq!(ws.dialog.step, ConnDialogStep::PickType);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn clicking_outside_the_dialog_card_dismisses_it(cx: &mut TestAppContext) {
+    let (handle, ws) = open_workspace(cx);
+    AnyWindowHandle::from(*handle)
+        .update(cx, |_, window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.open_conn_dialog(window, cx);
+            });
+            window.draw(cx);
+
+            // Top-left corner: outside the centered card, on the backdrop.
+            simulate_click(window, cx, Point::new(px(8.), px(8.)));
+            window.draw(cx);
+
+            assert!(
+                !ws.read(cx).dialog_open,
+                "clicking the dimmed backdrop must dismiss the dialog"
+            );
+        })
+        .unwrap();
+}
+
+fn px(value: f32) -> Pixels {
+    Pixels::from(value)
 }
