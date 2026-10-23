@@ -13,7 +13,6 @@ use std::collections::BTreeSet;
 use sqlpro_core::change::{PendingChanges, RowID};
 use sqlpro_core::connection::ConnectionConfig;
 use sqlpro_core::database_type::DatabaseType;
-use sqlpro_core::driver::DatabaseDriver;
 use sqlpro_core::history::{QueryHistoryEntry, QueryHistoryStorage};
 use sqlpro_core::sqlgen::{SqlStatementGenerator, DEFAULT_MARKER};
 use sqlpro_core::value::CellValue;

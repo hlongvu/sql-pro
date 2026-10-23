@@ -384,7 +384,7 @@ impl<'a> tokio_postgres::types::ToSql for PgParam {
         tokio_postgres::types::IsNull,
         Box<dyn std::error::Error + Sync + Send>,
     > {
-                use tokio_postgres::types::{IsNull, Type, ToSql as _};
+                use tokio_postgres::types::{IsNull, Type};
         use std::str::FromStr;
 
         let Some(raw) = &self.raw else {

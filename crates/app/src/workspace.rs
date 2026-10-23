@@ -74,7 +74,6 @@ enum TabKind {
 
 #[derive(Debug, Clone)]
 struct WorkspaceTab {
-    id: uuid::Uuid,
     title: String,
     kind: TabKind,
     preview: bool,
@@ -82,7 +81,6 @@ struct WorkspaceTab {
     dirty: bool,
     origin_table: Option<String>,
     page_offset: usize,
-    filters: Vec<FilterCondition>,
     sort: Vec<(String, SortDirection)>,
 }
 
@@ -90,7 +88,6 @@ impl WorkspaceTab {
     fn table(name: impl Into<String>, preview: bool) -> Self {
         let title = name.into();
         Self {
-            id: uuid::Uuid::new_v4(),
             title: title.clone(),
             kind: TabKind::Table,
             preview,
@@ -98,14 +95,12 @@ impl WorkspaceTab {
             dirty: false,
             origin_table: Some(title),
             page_offset: 0,
-            filters: Vec::new(),
             sort: Vec::new(),
         }
     }
 
     fn query(title: impl Into<String>) -> Self {
         Self {
-            id: uuid::Uuid::new_v4(),
             title: title.into(),
             kind: TabKind::Query,
             preview: false,
@@ -113,7 +108,6 @@ impl WorkspaceTab {
             dirty: false,
             origin_table: None,
             page_offset: 0,
-            filters: Vec::new(),
             sort: Vec::new(),
         }
     }
@@ -221,8 +215,6 @@ enum RowCopyFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfirmAction {
     RunQuery,
-    DiscardChanges,
-    CommitChanges,
 }
 
 impl RowCopyFormat {
@@ -284,12 +276,10 @@ pub struct Workspace {
     filter_operator: FilterOperator,
     preview_sql: Option<Vec<String>>,
     confirm_action: Option<ConfirmAction>,
-    request_generation: u64,
 
     // UI state
     show_inspector: bool,
     show_console: bool,
-    objects_tab: usize,   // 0 = Items, 1 = History
     inspector_tab: usize, // 0 = Details, 1 = Assistant
     grid_mode: GridMode,
     safe_mode: SafeMode,
@@ -576,10 +566,8 @@ impl Workspace {
             filter_operator: FilterOperator::Contains,
             preview_sql: None,
             confirm_action: None,
-            request_generation: 0,
             show_inspector: false,
             show_console: false,
-            objects_tab: 0,
             inspector_tab: 0,
             grid_mode: GridMode::Data,
             safe_mode: SafeMode::Warn,
@@ -739,6 +727,7 @@ impl Workspace {
     }
 
     /// Test hook: borrow one of the dialog's inputs by field.
+    #[cfg(test)]
     pub(crate) fn dialog_input(
         &self,
         pick: impl Fn(&ConnDialog) -> &Entity<InputState>,

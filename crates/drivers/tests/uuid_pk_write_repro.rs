@@ -8,8 +8,7 @@ use sqlpro_core::database_type::DatabaseType;
 use sqlpro_core::sqlgen::SqlStatementGenerator;
 use sqlpro_core::value::CellValue;
 use sqlpro_core::write::{
-    engine_reports_real_counts, DataWriteExecutor, DataWritePlan, ParameterizedExecutor,
-    TransactionOwner,
+    engine_reports_real_counts, DataWriteExecutor, DataWritePlan, TransactionOwner,
 };
 
 fn config() -> ConnectionConfig {
