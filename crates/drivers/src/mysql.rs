@@ -12,6 +12,7 @@ use sqlpro_core::schema::{ColumnInfo, TableInfo};
 
 use mysql_async::consts::ColumnFlags;
 use mysql_async::prelude::*;
+use mysql_async::{PoolConstraints, PoolOpts};
 
 use crate::runtime::on_tokio;
 use crate::sql_split::split_statements;
@@ -32,11 +33,15 @@ impl MySqlDriver {
         let database = config.database.clone().unwrap_or_default();
         let socket = config.path.clone();
 
+        let pool_opts = PoolOpts::default().with_constraints(
+            PoolConstraints::new(0, 1).expect("a one-connection pool is valid"),
+        );
         let mut builder = mysql_async::OptsBuilder::default()
             .ip_or_hostname(host)
             .tcp_port(port)
             .user(Some(username))
-            .pass(Some(password));
+            .pass(Some(password))
+            .pool_opts(pool_opts);
 
         if !database.is_empty() {
             builder = builder.db_name(Some(database));
@@ -168,10 +173,13 @@ impl DatabaseDriver for MySqlDriver {
     }
 }
 
-async fn run_statement(
-    conn: &mut mysql_async::Conn,
+async fn run_statement<Q>(
+    conn: &mut Q,
     stmt: &str,
-) -> Result<(Option<(Vec<ColumnInfo>, Vec<Vec<CellValue>>)>, u64)> {
+) -> Result<(Option<(Vec<ColumnInfo>, Vec<Vec<CellValue>>)>, u64)>
+where
+    Q: Queryable + Send,
+{
     let result = conn
         .query_iter(stmt)
         .await
@@ -231,6 +239,35 @@ fn quote_string(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+struct MySqlWriteSession {
+    conn: Option<mysql_async::Conn>,
+}
+
+impl MySqlWriteSession {
+    fn conn_mut(&mut self) -> Result<&mut mysql_async::Conn> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| Error::Driver("MySQL write session is closed".into()))
+    }
+}
+
+#[async_trait::async_trait]
+impl sqlpro_core::write::ParameterizedSession for MySqlWriteSession {
+    async fn execute(&mut self, sql: &str) -> Result<()> {
+        self.conn_mut()?
+            .query_drop(sql)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))
+    }
+
+    async fn execute_parameterized(
+        &mut self,
+        sql: &str,
+        parameters: &[Option<sqlpro_core::value::BindValue>],
+    ) -> Result<u64> {
+        execute_parameterized_on(self.conn_mut()?, sql, parameters).await
+    }
+}
 
 #[async_trait::async_trait]
 impl sqlpro_core::write::ParameterizedExecutor for MySqlDriver {
@@ -241,32 +278,59 @@ impl sqlpro_core::write::ParameterizedExecutor for MySqlDriver {
     ) -> sqlpro_core::error::Result<u64> {
         let pool = self.pool.clone();
         let sql = sql.to_string();
-        let params: Vec<Option<sqlpro_core::value::BindValue>> = parameters.to_vec();
+        let params = parameters.to_vec();
         on_tokio(async move {
             let mut conn = pool
                 .get_conn()
                 .await
-                .map_err(|e| sqlpro_core::error::Error::Query(e.to_string()))?;
-            let values: Vec<mysql_async::Value> = params
-                .into_iter()
-                .map(|p| match p {
-                    None => mysql_async::Value::NULL,
-                    Some(sqlpro_core::value::BindValue::Text(s)) => mysql_async::Value::Bytes(s.into_bytes()),
-                    Some(sqlpro_core::value::BindValue::Bytes(b)) => mysql_async::Value::Bytes(b),
-                })
-                .collect();
-            let result = conn
-                .exec_iter(sql, values)
-                .await
-                .map_err(|e| sqlpro_core::error::Error::Query(e.to_string()))?;
-            let affected = result.affected_rows();
-            // Drain so the connection is usable for the next statement.
-            result
-                .collect_and_drop::<mysql_async::Row>()
-                .await
-                .map_err(|e| sqlpro_core::error::Error::Query(e.to_string()))?;
-            Ok(affected)
+                .map_err(|e| Error::Query(e.to_string()))?;
+            execute_parameterized_on(&mut conn, &sql, &params).await
         })
         .await
     }
+
+    async fn write_session(
+        &self,
+    ) -> Result<Box<dyn sqlpro_core::write::ParameterizedSession + '_>> {
+        let pool = self.pool.clone();
+        let conn = on_tokio(async move {
+            pool.get_conn()
+                .await
+                .map_err(|e| Error::Query(e.to_string()))
+        })
+        .await?;
+        Ok(Box::new(MySqlWriteSession { conn: Some(conn) }))
+    }
+}
+
+async fn execute_parameterized_on<Q>(
+    conn: &mut Q,
+    sql: &str,
+    parameters: &[Option<sqlpro_core::value::BindValue>],
+) -> Result<u64>
+where
+    Q: Queryable + Send,
+{
+    let values: Vec<mysql_async::Value> = parameters
+        .iter()
+        .map(|parameter| match parameter {
+            None => mysql_async::Value::NULL,
+            Some(sqlpro_core::value::BindValue::Text(value)) => {
+                mysql_async::Value::Bytes(value.as_bytes().to_vec())
+            }
+            Some(sqlpro_core::value::BindValue::Bytes(value)) => {
+                mysql_async::Value::Bytes(value.clone())
+            }
+        })
+        .collect();
+    let result = conn
+        .exec_iter(sql, values)
+        .await
+        .map_err(|e| Error::Query(e.to_string()))?;
+    let affected = result.affected_rows();
+    result
+        .collect_and_drop::<mysql_async::Row>()
+        .await
+        .map_err(|e| Error::Query(e.to_string()))?;
+    Ok(affected)
 }

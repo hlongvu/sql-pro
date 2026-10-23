@@ -2,14 +2,13 @@
 //! verification semantics as TablePro's `DataWriteExecutor`.
 //!
 //! Key rules ported from `KeyedWriteVerification` / `DataWriteRowCounts`:
-//! - Keyed writes: `rows_affected > expected` is a fault; `< expected` is
-//!   NOT (MySQL reports 0 affected for an UPDATE that writes a value the
-//!   row already holds).
-//! - Keyless writes: two-sided (`< expected` is also a fault) — but only on
-//!   engines that report real affected counts.
+//! - Keyed writes require the expected count on engines with reliable counts.
+//!   The sole exception is a MySQL no-op UPDATE, which reports zero changed
+//!   rows even though the keyed row matched.
+//! - Keyless writes are also verified two-sided on reliable-count engines.
 //! - Prologue/epilogue run OUTSIDE the transaction (SQLite `PRAGMA
-//!   foreign_keys` is a no-op inside one); a required prologue failure
-//!   stops the run before any step.
+//!   foreign_keys` is a no-op inside one); the epilogue is attempted after
+//!   success and every failure path.
 
 use async_trait::async_trait;
 
@@ -117,6 +116,13 @@ pub enum DataWriteError {
         actual: u64,
     },
 
+    #[error("keyed write matched {actual} of {expected} expected rows: {sql}")]
+    KeyedCountMismatch {
+        sql: String,
+        expected: usize,
+        actual: u64,
+    },
+
     #[error("keyless write matched {actual} of {expected} expected rows: {sql}")]
     KeylessCountMismatch {
         sql: String,
@@ -131,8 +137,43 @@ pub enum DataWriteError {
     Query(String),
 }
 
-/// Trait for executing a statement with bound parameters, used by the
-/// write path. Implemented per engine.
+/// A write-scoped physical database session.
+///
+/// The default implementation delegates to the driver, preserving existing
+/// engines. Drivers backed by a pool override session creation so BEGIN,
+/// every parameterized step, and COMMIT/ROLLBACK cannot hop connections.
+#[async_trait]
+pub trait ParameterizedSession: Send {
+    async fn execute(&mut self, sql: &str) -> Result<()>;
+
+    async fn execute_parameterized(
+        &mut self,
+        sql: &str,
+        parameters: &[Option<BindValue>],
+    ) -> Result<u64>;
+}
+
+struct DriverSession<'a> {
+    driver: &'a dyn ParameterizedExecutor,
+}
+
+#[async_trait]
+impl ParameterizedSession for DriverSession<'_> {
+    async fn execute(&mut self, sql: &str) -> Result<()> {
+        self.driver.execute(sql).await.map(|_| ())
+    }
+
+    async fn execute_parameterized(
+        &mut self,
+        sql: &str,
+        parameters: &[Option<BindValue>],
+    ) -> Result<u64> {
+        self.driver.execute_parameterized(sql, parameters).await
+    }
+}
+
+/// Trait for executing statements with bound parameters, used by the write
+/// path. Implemented per engine.
 #[async_trait]
 pub trait ParameterizedExecutor: DatabaseDriver {
     async fn execute_parameterized(
@@ -140,6 +181,14 @@ pub trait ParameterizedExecutor: DatabaseDriver {
         sql: &str,
         parameters: &[Option<BindValue>],
     ) -> Result<u64>;
+
+    async fn write_session(&self) -> Result<Box<dyn ParameterizedSession + '_>>;
+}
+
+pub fn default_write_session<'a>(
+    driver: &'a dyn ParameterizedExecutor,
+) -> Box<dyn ParameterizedSession + 'a> {
+    Box::new(DriverSession { driver })
 }
 
 pub struct DataWriteExecutor<'a> {
@@ -148,8 +197,18 @@ pub struct DataWriteExecutor<'a> {
     pub real_counts: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CountMismatch {
+    TooMany,
+    KeyedTooFew,
+    KeylessTooFew,
+}
+
 impl<'a> DataWriteExecutor<'a> {
-    pub async fn run(&self, plan: &DataWritePlan) -> std::result::Result<DataWriteResult, DataWriteError> {
+    pub async fn run(
+        &self,
+        plan: &DataWritePlan,
+    ) -> std::result::Result<DataWriteResult, DataWriteError> {
         let mut result = DataWriteResult::default();
 
         let active_steps: Vec<&DataWriteStep> = plan
@@ -161,9 +220,19 @@ impl<'a> DataWriteExecutor<'a> {
             return Ok(result);
         }
 
-        // Prologue, outside the transaction. A required prologue failure
-        // stops the run before any step; an optional one (e.g. FK toggles)
-        // is a courtesy that can be skipped.
+        let outcome = self.run_active_steps(plan, &active_steps, &mut result).await;
+        self.run_epilogue(plan).await;
+        outcome.map(|_| result)
+    }
+
+    async fn run_active_steps(
+        &self,
+        plan: &DataWritePlan,
+        active_steps: &[&DataWriteStep],
+        result: &mut DataWriteResult,
+    ) -> std::result::Result<(), DataWriteError> {
+        // Prologue and epilogue intentionally use the general driver session:
+        // SQLite foreign-key PRAGMAs are ineffective inside a transaction.
         for statement in &plan.prologue {
             if let Err(e) = self
                 .driver
@@ -176,23 +245,27 @@ impl<'a> DataWriteExecutor<'a> {
             }
         }
 
-        // Open the transaction when we own one.
+        let mut session = self
+            .driver
+            .write_session()
+            .await
+            .map_err(|e| DataWriteError::Query(e.to_string()))?;
         let wrapped = plan.owner == TransactionOwner::App;
         if wrapped {
-            if let Err(e) = self.driver.execute("BEGIN").await {
-                return Err(DataWriteError::Query(e.to_string()));
-            }
+            session
+                .execute("BEGIN")
+                .await
+                .map_err(|e| DataWriteError::Query(e.to_string()))?;
         }
 
         for step in active_steps {
-            let actual = match self
-                .driver
+            let actual = match session
                 .execute_parameterized(&step.statement.sql, &step.statement.parameters)
                 .await
             {
                 Ok(n) => n,
                 Err(e) => {
-                    self.handle_failure(plan, wrapped).await;
+                    self.handle_failure(session.as_mut(), wrapped).await;
                     return Err(DataWriteError::Query(e.to_string()));
                 }
             };
@@ -203,60 +276,76 @@ impl<'a> DataWriteExecutor<'a> {
                 rows_affected: actual,
             });
 
-            // Verification (KeyedWriteVerification semantics).
-            if let Some(expected) = step.expected_row_count {
-                let keyless = step.matches_rows_without_key && self.real_counts;
-                if actual > expected as u64 {
-                    self.handle_failure(plan, wrapped).await;
-                    return Err(DataWriteError::TooManyRows {
+            if let Some((expected, mismatch)) = self.count_mismatch(step, actual) {
+                self.handle_failure(session.as_mut(), wrapped).await;
+                return Err(match mismatch {
+                    CountMismatch::TooMany => DataWriteError::TooManyRows {
                         sql: step.statement.sql.clone(),
                         expected,
                         actual,
-                    });
-                }
-                if keyless && actual < expected as u64 {
-                    self.handle_failure(plan, wrapped).await;
-                    return Err(DataWriteError::KeylessCountMismatch {
+                    },
+                    CountMismatch::KeyedTooFew => DataWriteError::KeyedCountMismatch {
                         sql: step.statement.sql.clone(),
                         expected,
                         actual,
-                    });
-                }
+                    },
+                    CountMismatch::KeylessTooFew => DataWriteError::KeylessCountMismatch {
+                        sql: step.statement.sql.clone(),
+                        expected,
+                        actual,
+                    },
+                });
             }
         }
 
         if wrapped {
-            if let Err(e) = self.driver.execute("COMMIT").await {
-                // The commit failed: attempt rollback, and if that fails
-                // too, what ran is partially committed.
-                let rollback_ok = self.driver.execute("ROLLBACK").await.is_ok();
-                if !rollback_ok {
+            if let Err(e) = session.execute("COMMIT").await {
+                // A failed COMMIT has an unknown outcome. Try to close the
+                // transaction and retain the existing partial-commit signal
+                // when even that cannot be confirmed.
+                if session.execute("ROLLBACK").await.is_err() {
                     result.partial_commit = true;
                 }
                 return Err(DataWriteError::Query(e.to_string()));
             }
         }
 
-        // Epilogue, after commit/rollback either way.
+        Ok(())
+    }
+
+    fn count_mismatch(&self, step: &DataWriteStep, actual: u64) -> Option<(usize, CountMismatch)> {
+        let expected = step.expected_row_count?;
+        if actual > expected as u64 {
+            return Some((expected, CountMismatch::TooMany));
+        }
+        if !self.real_counts || actual >= expected as u64 {
+            return None;
+        }
+        if step.matches_rows_without_key {
+            return Some((expected, CountMismatch::KeylessTooFew));
+        }
+
+        // MySQL reports changed rows, not matched rows, so zero is valid only
+        // for a no-op UPDATE. DELETE counts remain reliable and INSERT cannot
+        // legitimately affect fewer rows without an error.
+        let mysql_noop_update = self.driver.label() == "MySQL"
+            && step.kind == RowWriteKind::Update
+            && actual == 0;
+        (!mysql_noop_update).then_some((expected, CountMismatch::KeyedTooFew))
+    }
+
+    async fn handle_failure(&self, session: &mut dyn ParameterizedSession, wrapped: bool) {
+        if wrapped {
+            let _ = session.execute("ROLLBACK").await;
+        }
+    }
+
+    async fn run_epilogue(&self, plan: &DataWritePlan) {
         for statement in &plan.epilogue {
             let _ = self
                 .driver
                 .execute_parameterized(&statement.sql, &statement.parameters)
                 .await;
-        }
-
-        Ok(result)
-    }
-
-    async fn handle_failure(&self, plan: &DataWritePlan, wrapped: bool) {
-        match plan.owner {
-            TransactionOwner::App if wrapped => {
-                let _ = self.driver.execute("ROLLBACK").await;
-            }
-            _ => {
-                // Without a transaction we own, nothing to roll back — the
-                // caller sees the error and the already-run statements.
-            }
         }
     }
 }

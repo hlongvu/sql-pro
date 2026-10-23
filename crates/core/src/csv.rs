@@ -5,6 +5,11 @@
 //! `CSVDialect.detect`, and `CSVTypeInferrer`, preserving the exact rules
 //! their tests pin down.
 
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use crate::value::CellValue;
+
 /// How a CSV field's quoting is decided (TablePro's `CSVQuoteHandling`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QuoteHandling {
@@ -293,6 +298,150 @@ pub fn infer_column_type(values: &[&str]) -> InferredType {
     InferredType::Text
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultExportFormat {
+    Csv,
+    Json,
+}
+
+impl ResultExportFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Csv => "csv",
+            Self::Json => "json",
+        }
+    }
+}
+
+/// Encode one result set without losing NULL/binary distinctions.
+pub fn encode_result(
+    format: ResultExportFormat,
+    columns: &[String],
+    rows: &[Vec<CellValue>],
+) -> std::result::Result<Vec<u8>, serde_json::Error> {
+    match format {
+        ResultExportFormat::Csv => {
+            let options = CsvFieldOptions::default();
+            let mut out = String::new();
+            let header = columns
+                .iter()
+                .map(|name| csv_field(name, ',', &options))
+                .collect::<Vec<_>>()
+                .join(",");
+            out.push_str(&header);
+            out.push('\n');
+            for row in rows {
+                let values = row
+                    .iter()
+                    .map(|value| match value {
+                        CellValue::Null => String::new(),
+                        CellValue::Text(text) => csv_field(text, ',', &options),
+                        CellValue::Bytes(bytes) => {
+                            let hex = bytes
+                                .iter()
+                                .map(|byte| format!("{byte:02X}"))
+                                .collect::<String>();
+                            csv_field(&format!("0x{hex}"), ',', &options)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                out.push_str(&values);
+                out.push('\n');
+            }
+            Ok(out.into_bytes())
+        }
+        ResultExportFormat::Json => {
+            let records = rows
+                .iter()
+                .map(|row| {
+                    let mut record = serde_json::Map::new();
+                    for (index, column) in columns.iter().enumerate() {
+                        let value = match row.get(index) {
+                            None | Some(CellValue::Null) => serde_json::Value::Null,
+                            Some(CellValue::Text(text)) => {
+                                serde_json::Value::String(text.clone())
+                            }
+                            Some(CellValue::Bytes(bytes)) => {
+                                let hex = bytes
+                                    .iter()
+                                    .map(|byte| format!("{byte:02X}"))
+                                    .collect::<String>();
+                                serde_json::Value::String(format!("0x{hex}"))
+                            }
+                        };
+                        record.insert(column.clone(), value);
+                    }
+                    serde_json::Value::Object(record)
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_vec_pretty(&records)
+        }
+    }
+}
+
+/// Atomically create an export file without overwriting an existing path.
+///
+/// When `preferred` already exists, `-2`, `-3`, ... is appended before the
+/// extension. The temporary file lives beside the destination so `rename` is
+/// atomic on the target filesystem.
+pub fn write_export_unique(preferred: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    let destination = unique_path(preferred);
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sqlpro-export");
+    let temp = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, &destination)?;
+        Ok(destination.clone())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn unique_path(preferred: &Path) -> PathBuf {
+    if !preferred.exists() {
+        return preferred.to_path_buf();
+    }
+
+    let parent = preferred.parent().unwrap_or_else(|| Path::new("."));
+    let stem = preferred
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("sqlpro-export");
+    let extension = preferred.extension().and_then(|value| value.to_str());
+
+    for suffix in 2usize.. {
+        let file_name = match extension {
+            Some(extension) => format!("{stem}-{suffix}.{extension}"),
+            None => format!("{stem}-{suffix}"),
+        };
+        let candidate = parent.join(file_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,5 +615,50 @@ mod tests {
     #[test]
     fn empty_sample_is_text() {
         assert_eq!(infer_column_type(&["", ""]), InferredType::Text);
+    }
+
+    #[test]
+    fn result_csv_preserves_null_and_binary_distinctions() {
+        let bytes = encode_result(
+            ResultExportFormat::Csv,
+            &["name".into(), "payload".into(), "missing".into()],
+            &[vec![
+                CellValue::text("=formula"),
+                CellValue::bytes([0x00, 0xAF]),
+                CellValue::Null,
+            ]],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "name,payload,missing\n\"'=formula\",0x00AF,\n"
+        );
+    }
+
+    #[test]
+    fn result_json_uses_objects_and_real_nulls() {
+        let bytes = encode_result(
+            ResultExportFormat::Json,
+            &["id".into(), "value".into()],
+            &[vec![CellValue::text("1"), CellValue::Null]],
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value, serde_json::json!([{ "id": "1", "value": null }]));
+    }
+
+    #[test]
+    fn atomic_export_never_overwrites_an_existing_file() {
+        let root = std::env::temp_dir().join(format!("sqlpro-export-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let preferred = root.join("results.csv");
+        std::fs::write(&preferred, b"original").unwrap();
+
+        let written = write_export_unique(&preferred, b"replacement").unwrap();
+        assert_eq!(written.file_name().unwrap(), "results-2.csv");
+        assert_eq!(std::fs::read(&preferred).unwrap(), b"original");
+        assert_eq!(std::fs::read(&written).unwrap(), b"replacement");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

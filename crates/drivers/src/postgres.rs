@@ -2,7 +2,7 @@
 //! later milestone). Redshift and CockroachDB ride the same wire protocol,
 //! like TablePro routes them through libpq.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sqlpro_core::value::CellValue;
 use sqlpro_core::connection::ConnectionConfig;
@@ -34,20 +34,24 @@ impl PostgresDriver {
         let database = config.database.clone().unwrap_or_else(|| username.clone());
         let password = config.password.clone().unwrap_or_default();
 
-        let conn_string = format!(
-            "host={} port={} user={} password={} dbname={} connect_timeout={}",
-            host, port, username, password, database, config.query_timeout_secs
-        );
+        let mut pg_config = tokio_postgres::Config::new();
+        pg_config
+            .host(&host)
+            .port(port)
+            .user(&username)
+            .password(password.as_bytes())
+            .dbname(&database)
+            .connect_timeout(Duration::from_secs(config.query_timeout_secs));
 
         // spawn + lightweight wait instead of block_on: create_driver may be
         // called from inside the shared Tokio runtime (via on_tokio), where
         // block_on would panic.
         let client = futures::executor::block_on(async move {
             let handle = crate::runtime::runtime().spawn(async move {
-                let (client, connection) =
-                    tokio_postgres::connect(&conn_string, tokio_postgres::NoTls)
-                        .await
-                        .map_err(|e| Error::Connection(e.to_string()))?;
+                let (client, connection) = pg_config
+                    .connect(tokio_postgres::NoTls)
+                    .await
+                    .map_err(|e| Error::Connection(e.to_string()))?;
                 tokio::spawn(async move {
                     if let Err(e) = connection.await {
                         eprintln!("postgres connection closed: {e}");
@@ -380,7 +384,7 @@ impl<'a> tokio_postgres::types::ToSql for PgParam {
         tokio_postgres::types::IsNull,
         Box<dyn std::error::Error + Sync + Send>,
     > {
-                use tokio_postgres::types::{IsNull, ToSql, Type};
+                use tokio_postgres::types::{IsNull, Type, ToSql as _};
         use std::str::FromStr;
 
         let Some(raw) = &self.raw else {
@@ -491,6 +495,12 @@ impl<'a> tokio_postgres::types::ToSql for PgParam {
 
 #[async_trait::async_trait]
 impl sqlpro_core::write::ParameterizedExecutor for PostgresDriver {
+    async fn write_session(
+        &self,
+    ) -> sqlpro_core::error::Result<Box<dyn sqlpro_core::write::ParameterizedSession + '_>> {
+        Ok(sqlpro_core::write::default_write_session(self))
+    }
+
     async fn execute_parameterized(
         &self,
         sql: &str,

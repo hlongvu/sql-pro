@@ -109,6 +109,10 @@ fn insert_with_null_value() {
 
 #[test]
 fn insert_skips_default_columns() {
+    // The `__DEFAULT__` sentinel in stored inserted-row data is app-created
+    // ("+ Row" seeds every column with it), meaning "let the server default
+    // this column" — those columns are omitted from the INSERT. User edits
+    // replace the sentinel with their typed text before generation.
     let g = make_generator("users", vec!["id", "name", "email"], vec!["id"], db("mysql"));
     let changes = vec![insert_change(RowID::Existing(0))];
     let statements = run(
@@ -128,6 +132,8 @@ fn insert_skips_default_columns() {
 
 #[test]
 fn insert_all_default_names_no_column() {
+    // A brand-new row saved without touching any cell inserts with server
+    // defaults only.
     for (database_type, expected) in [
         ("mysql", "() VALUES ()"),
         ("postgresql", "DEFAULT VALUES"),
@@ -165,7 +171,9 @@ fn insert_from_cell_changes_fallback() {
 }
 
 #[test]
-fn insert_with_sql_function() {
+fn temporal_function_text_is_bound_literally() {
+    // `NOW()` typed into a cell is a string, not SQL: the generator must not
+    // execute arbitrary cell text as an expression (SQL injection surface).
     let g = make_generator("users", vec!["id", "name", "email"], vec!["id"], db("mysql"));
     let changes = vec![insert_change(RowID::Existing(0))];
     let statements = run(
@@ -177,8 +185,9 @@ fn insert_with_sql_function() {
     );
     assert_eq!(statements.len(), 1);
     let (sql, params) = &statements[0];
-    assert!(sql.contains("NOW()"));
-    assert_eq!(params.len(), 2);
+    assert!(!sql.contains("NOW()"), "function text must not reach SQL: {sql}");
+    assert_eq!(params.len(), 3);
+    assert_eq!(param_text(params, 2), "NOW()");
 }
 
 #[test]
@@ -325,7 +334,9 @@ fn update_with_null_new_value() {
 }
 
 #[test]
-fn update_with_default_value() {
+fn update_default_marker_is_bound_literally() {
+    // Same rule on UPDATE: the marker is text the user typed, and only the
+    // explicit SqlValue::Default path may emit `= DEFAULT`.
     let g = make_generator("users", vec!["id", "name", "email"], vec!["id"], db("mysql"));
     let mut change = RowChange::new(RowID::Existing(0), ChangeType::Update);
     change.cell_changes.push(CellChange::new(1, "name", text("John"), text("__DEFAULT__")));
@@ -333,12 +344,17 @@ fn update_with_default_value() {
 
     let statements = run(&g, vec![change], vec![], vec![], vec![]);
     assert_eq!(statements.len(), 1);
-    assert!(statements[0].0.contains("`name` = DEFAULT"));
-    assert_eq!(statements[0].1.len(), 1); // only the PK bind
+    let (sql, params) = &statements[0];
+    assert!(!sql.contains("= DEFAULT"), "{sql}");
+    assert!(sql.contains("`name` = ?"));
+    assert_eq!(params.len(), 2); // SET bind + PK bind
+    assert_eq!(param_text(params, 0), "__DEFAULT__");
 }
 
 #[test]
-fn update_with_sql_function() {
+fn update_temporal_function_text_is_bound_literally() {
+    // `NOW()` in an UPDATE binds as a string; executing cell text as SQL
+    // would let grid input inject expressions.
     let g = make_generator("users", vec!["id", "name", "email"], vec!["id"], db("mysql"));
     let mut change = RowChange::new(RowID::Existing(0), ChangeType::Update);
     change.cell_changes.push(CellChange::new(1, "name", text("John"), text("NOW()")));
@@ -347,8 +363,9 @@ fn update_with_sql_function() {
     let statements = run(&g, vec![change], vec![], vec![], vec![]);
     assert_eq!(statements.len(), 1);
     let (sql, params) = &statements[0];
-    assert!(sql.contains("NOW()"));
-    assert_eq!(params.len(), 1); // only the PK bind
+    assert!(!sql.contains("NOW()"), "{sql}");
+    assert_eq!(params.len(), 2); // SET bind + PK bind
+    assert_eq!(param_text(params, 0), "NOW()");
 }
 
 #[test]

@@ -20,6 +20,22 @@ pub enum ParameterStyle {
     Dollar,
 }
 
+impl ParameterStyle {
+    pub fn for_database_type(database_type: &DatabaseType) -> Self {
+        match database_type.driver_id() {
+            "postgresql" | "duckdb" => Self::Dollar,
+            _ => Self::QuestionMark,
+        }
+    }
+
+    pub fn placeholder(self, index: usize) -> String {
+        match self {
+            Self::Dollar => format!("${}", index + 1),
+            Self::QuestionMark => "?".to_string(),
+        }
+    }
+}
+
 /// The engine facts statement generation needs: the identifier quote
 /// character, whether string literals treat backslash as an escape
 /// (MySQL family — writing ANSI rules there silently rewrites data), and
@@ -294,13 +310,7 @@ impl SqlStatementGenerator {
     }
 
     fn default_parameter_style(database_type: &DatabaseType) -> ParameterStyle {
-        // Plugin metadata decides; the built-in dollar-style engines are
-        // the PostgreSQL family and DuckDB.
-        match database_type.driver_id() {
-            "postgresql" => ParameterStyle::Dollar,
-            other if other == "duckdb" => ParameterStyle::Dollar,
-            _ => ParameterStyle::QuestionMark,
-        }
+        ParameterStyle::for_database_type(database_type)
     }
 
     pub fn quote_identifier(&self, name: &str) -> String {
@@ -318,10 +328,7 @@ impl SqlStatementGenerator {
     }
 
     fn placeholder(&self, index: usize) -> String {
-        match self.parameter_style {
-            ParameterStyle::Dollar => format!("${}", index + 1),
-            ParameterStyle::QuestionMark => "?".to_string(),
-        }
+        self.parameter_style.placeholder(index)
     }
 
     pub fn max_bind_parameters(&self) -> usize {
@@ -442,13 +449,14 @@ impl SqlStatementGenerator {
         let mut bind_parameters: Vec<Option<BindValue>> = Vec::new();
 
         for (index, value) in values.iter().enumerate() {
-            if let CellValue::Text(s) = value {
-                if s == DEFAULT_MARKER {
-                    continue;
-                }
-            }
-
             if index >= self.columns.len() {
+                continue;
+            }
+            // `DEFAULT_MARKER` in stored inserted-row data is the app-created
+            // "let the server fill this column" sentinel ("+ Row" seeds it),
+            // never user text: user edits replace it before generation. It is
+            // skipped so untouched columns fall back to server defaults.
+            if matches!(value, CellValue::Text(s) if s == DEFAULT_MARKER) {
                 continue;
             }
             let column_name = &self.columns[index];
@@ -458,12 +466,6 @@ impl SqlStatementGenerator {
 
             non_default_columns.push(self.quote_identifier(column_name));
 
-            if let CellValue::Text(s) = value {
-                if is_temporal_function(s) {
-                    placeholder_parts.push(s.trim().to_uppercase());
-                    continue;
-                }
-            }
             bind_parameters.push(Option::<BindValue>::from(value));
             placeholder_parts.push(self.placeholder(bind_parameters.len() - 1));
         }
@@ -572,10 +574,7 @@ impl SqlStatementGenerator {
         let non_default_changes: Vec<&crate::change::CellChange> = change
             .cell_changes
             .iter()
-            .filter(|c| {
-                c.new_value != CellValue::Text(DEFAULT_MARKER.to_string())
-                    && !self.generated_columns.contains(&c.column_name)
-            })
+            .filter(|c| !self.generated_columns.contains(&c.column_name))
             .collect();
 
         if non_default_changes.is_empty() {
@@ -590,12 +589,6 @@ impl SqlStatementGenerator {
         let mut parameters: Vec<Option<BindValue>> = Vec::new();
         let mut placeholders: Vec<String> = Vec::new();
         for cell_change in &non_default_changes {
-            if let CellValue::Text(s) = &cell_change.new_value {
-                if is_temporal_function(s) {
-                    placeholders.push(s.trim().to_uppercase());
-                    continue;
-                }
-            }
             parameters.push(Option::<BindValue>::from(&cell_change.new_value));
             placeholders.push(self.placeholder(parameters.len() - 1));
         }
@@ -631,16 +624,6 @@ impl SqlStatementGenerator {
         let mut set_clauses: Vec<String> = Vec::new();
         for cell_change in &writable_changes {
             let quoted = self.quote_identifier(&cell_change.column_name);
-            if let CellValue::Text(s) = &cell_change.new_value {
-                if s == DEFAULT_MARKER {
-                    set_clauses.push(format!("{quoted} = DEFAULT"));
-                    continue;
-                }
-                if is_temporal_function(s) {
-                    set_clauses.push(format!("{quoted} = {}", s.trim().to_uppercase()));
-                    continue;
-                }
-            }
             parameters.push(Option::<BindValue>::from(&cell_change.new_value));
             set_clauses.push(format!("{quoted} = {}", self.placeholder(parameters.len() - 1)));
         }

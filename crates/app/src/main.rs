@@ -8,6 +8,9 @@
 #![recursion_limit = "1024"]
 
 mod grid;
+mod saved_queries;
+mod secret_store;
+mod storage;
 mod store;
 mod theme;
 mod workspace;

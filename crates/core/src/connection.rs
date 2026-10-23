@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 use crate::database_type::DatabaseType;
 use crate::error::{Error, Result};
+use crate::safety::ConnectionSafetyLevel;
 
 /// A connection's durable identity. Passwords live outside this struct in
 /// the platform secret store (macOS Keychain, libsecret, DPAPI), mirroring
@@ -39,6 +40,9 @@ pub struct ConnectionConfig {
     /// Free-form environment tag ("local", "prod", …) shown as a chip.
     #[serde(default)]
     pub tag: Option<String>,
+    /// Persisted statement protection for this connection.
+    #[serde(default)]
+    pub safety_level: ConnectionSafetyLevel,
 }
 
 fn default_query_timeout() -> u64 {
@@ -65,6 +69,7 @@ impl ConnectionConfig {
             query_timeout_secs: default_query_timeout(),
             color: None,
             tag: None,
+            safety_level: ConnectionSafetyLevel::default(),
         }
     }
 

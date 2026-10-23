@@ -13,8 +13,10 @@ pub mod error;
 pub mod fingerprint;
 pub mod history;
 pub mod result;
+pub mod safety;
 pub mod schema;
 pub mod sqlgen;
+pub mod table_query;
 pub mod value;
 pub mod write;
 

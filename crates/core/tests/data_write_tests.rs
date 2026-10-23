@@ -21,11 +21,18 @@ use sqlpro_core::write::{
 struct StubDriver {
     canned: Mutex<Vec<u64>>,
     executed: Mutex<Vec<String>>,
+    /// Drivers label themselves; the executor consults the label for the
+    /// MySQL changed-rows exception.
+    label: &'static str,
 }
 
 impl StubDriver {
     fn new(canned: Vec<u64>) -> Self {
-        Self { canned: Mutex::new(canned), executed: Mutex::new(Vec::new()) }
+        Self { canned: Mutex::new(canned), executed: Mutex::new(Vec::new()), label: "database" }
+    }
+
+    fn mysql(canned: Vec<u64>) -> Self {
+        Self { canned: Mutex::new(canned), executed: Mutex::new(Vec::new()), label: "MySQL" }
     }
 }
 
@@ -47,10 +54,20 @@ impl DatabaseDriver for StubDriver {
     async fn list_columns(&self, _table: &str) -> Result<Vec<ColumnInfo>> {
         Ok(Vec::new())
     }
+
+    fn label(&self) -> String {
+        self.label.to_string()
+    }
 }
 
 #[async_trait]
 impl ParameterizedExecutor for StubDriver {
+    async fn write_session(
+        &self,
+    ) -> Result<Box<dyn sqlpro_core::write::ParameterizedSession + '_>> {
+        Ok(sqlpro_core::write::default_write_session(self))
+    }
+
     async fn execute_parameterized(
         &self,
         sql: &str,
@@ -105,10 +122,10 @@ async fn too_many_rows_rolls_back() {
 }
 
 #[tokio::test]
-async fn fewer_rows_is_not_a_failure_for_keyed_writes() {
-    // MySQL reports 0 affected for an UPDATE writing a value the row
-    // already holds — a keyed write below expectation is fine.
-    let driver = StubDriver::new(vec![0]);
+async fn mysql_noop_update_is_not_a_failure_for_keyed_writes() {
+    // MySQL reports changed rows, not matched rows: an UPDATE writing a value
+    // the row already holds reports 0 even though the keyed row matched.
+    let driver = StubDriver::mysql(vec![0]);
     let executor = DataWriteExecutor { driver: &driver, real_counts: true };
     let plan = DataWritePlan {
         steps: vec![step("UPDATE t SET a = 1 WHERE id = 1", Some(1), false)],
@@ -118,6 +135,43 @@ async fn fewer_rows_is_not_a_failure_for_keyed_writes() {
         owner: TransactionOwner::App,
     };
     assert!(executor.run(&plan).await.is_ok());
+}
+
+#[tokio::test]
+async fn keyed_update_matching_nothing_fails_on_other_engines() {
+    // Only the MySQL changed-rows exception is allowed below expectation; a
+    // zero-row keyed UPDATE elsewhere means the row vanished.
+    let driver = StubDriver::new(vec![0]);
+    let executor = DataWriteExecutor { driver: &driver, real_counts: true };
+    let plan = DataWritePlan {
+        steps: vec![step("UPDATE t SET a = 1 WHERE id = 1", Some(1), false)],
+        prologue: vec![],
+        epilogue: vec![],
+        prologue_is_required: false,
+        owner: TransactionOwner::App,
+    };
+    let err = executor.run(&plan).await.unwrap_err();
+    assert!(matches!(err, sqlpro_core::write::DataWriteError::KeyedCountMismatch { .. }));
+    assert!(driver.executed.lock().unwrap().iter().any(|s| s == "ROLLBACK"));
+}
+
+#[tokio::test]
+async fn keyed_delete_matching_nothing_fails_even_on_mysql() {
+    // The no-op exception is UPDATE-only: a DELETE touching zero rows means
+    // the row was already gone, which the user must hear about.
+    let driver = StubDriver::mysql(vec![0]);
+    let executor = DataWriteExecutor { driver: &driver, real_counts: true };
+    let mut delete_step = step("DELETE FROM t WHERE id = 1", Some(1), false);
+    delete_step.kind = RowWriteKind::Delete;
+    let plan = DataWritePlan {
+        steps: vec![delete_step],
+        prologue: vec![],
+        epilogue: vec![],
+        prologue_is_required: false,
+        owner: TransactionOwner::App,
+    };
+    let err = executor.run(&plan).await.unwrap_err();
+    assert!(matches!(err, sqlpro_core::write::DataWriteError::KeyedCountMismatch { .. }));
 }
 
 #[tokio::test]
@@ -164,6 +218,12 @@ async fn a_required_prologue_that_fails_stops_the_run_before_any_step() {
     }
     #[async_trait]
     impl ParameterizedExecutor for FailingPrologue {
+        async fn write_session(
+            &self,
+        ) -> Result<Box<dyn sqlpro_core::write::ParameterizedSession + '_>> {
+            Ok(sqlpro_core::write::default_write_session(self))
+        }
+
         async fn execute_parameterized(
             &self,
             sql: &str,
@@ -201,6 +261,12 @@ async fn an_optional_prologue_that_fails_lets_the_steps_run() {
     }
     #[async_trait]
     impl ParameterizedExecutor for FailingPrologue {
+        async fn write_session(
+            &self,
+        ) -> Result<Box<dyn sqlpro_core::write::ParameterizedSession + '_>> {
+            Ok(sqlpro_core::write::default_write_session(self))
+        }
+
         async fn execute_parameterized(
             &self,
             sql: &str,

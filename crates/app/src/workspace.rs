@@ -35,8 +35,10 @@ use sqlpro_core::connection::{
 use sqlpro_core::database_type::DatabaseType;
 use sqlpro_core::history::{QueryHistoryEntry, QueryHistoryFilter, QueryHistoryStorage};
 use sqlpro_core::result::QueryResult;
+use sqlpro_core::safety::{confirmation_requirement, StatementRisk};
 use sqlpro_core::schema::{ColumnInfo, TableInfo};
 use sqlpro_core::sqlgen::{SqlStatementGenerator, DEFAULT_MARKER};
+use sqlpro_core::table_query::{FilterCondition, FilterOperator, SortDirection, TableQuery};
 use sqlpro_core::value::CellValue;
 use sqlpro_core::write::{
     engine_reports_real_counts, DataWriteExecutor, DataWritePlan, DataWriteResult,
@@ -45,6 +47,7 @@ use sqlpro_core::write::{
 
 use crate::grid::{ResultsDelegate, RowVisual};
 use crate::store;
+use crate::saved_queries::SavedQueryStore;
 
 actions!(
     workspace,
@@ -52,11 +55,69 @@ actions!(
         RunQuery, NewQuery, SaveChanges,
         EditCell, CopyCell, CopyRowJson, CopyRowYaml, CopyRowCsv, InsertRow, DeleteRow,
         CancelCellEdit,
+        OpenAnything,
+        CloseTab,
+        ToggleFilterBar,
+        PreviewChanges,
+        DiscardChanges,
     ]
 );
 
-const DEFAULT_ROW_LIMIT: usize = 500;
+const DEFAULT_ROW_LIMIT: usize = 300;
 const HISTORY_PANEL_SIZE: usize = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabKind {
+    Table,
+    Query,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceTab {
+    id: uuid::Uuid,
+    title: String,
+    kind: TabKind,
+    preview: bool,
+    pinned: bool,
+    dirty: bool,
+    origin_table: Option<String>,
+    page_offset: usize,
+    filters: Vec<FilterCondition>,
+    sort: Vec<(String, SortDirection)>,
+}
+
+impl WorkspaceTab {
+    fn table(name: impl Into<String>, preview: bool) -> Self {
+        let title = name.into();
+        Self {
+            id: uuid::Uuid::new_v4(),
+            title: title.clone(),
+            kind: TabKind::Table,
+            preview,
+            pinned: false,
+            dirty: false,
+            origin_table: Some(title),
+            page_offset: 0,
+            filters: Vec::new(),
+            sort: Vec::new(),
+        }
+    }
+
+    fn query(title: impl Into<String>) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4(),
+            title: title.into(),
+            kind: TabKind::Query,
+            preview: false,
+            pinned: false,
+            dirty: false,
+            origin_table: None,
+            page_offset: 0,
+            filters: Vec::new(),
+            sort: Vec::new(),
+        }
+    }
+}
 
 // Dark palette from ui_detail.md: near-black/charcoal canvas, subtle
 // one-pixel separators, restrained accent.
@@ -157,6 +218,13 @@ enum RowCopyFormat {
     Csv,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmAction {
+    RunQuery,
+    DiscardChanges,
+    CommitChanges,
+}
+
 impl RowCopyFormat {
     fn label(self) -> &'static str {
         match self {
@@ -202,6 +270,21 @@ pub struct Workspace {
     history: Option<QueryHistoryStorage>,
     history_entries: Vec<(String, String)>,
     console_log: Vec<(bool, String, String)>, // (ok, sql one-line, detail)
+
+    // TablePlus-style navigation state. Result data remains in the existing
+    // grid fields for now, while each tab owns its identity and browse query.
+    tabs: Vec<WorkspaceTab>,
+    active_tab: Option<usize>,
+    navigator_tab: usize, // 0 = Items, 1 = Queries, 2 = History
+    show_open_anything: bool,
+    open_anything_search: Entity<InputState>,
+    show_filter_bar: bool,
+    filter_column: Entity<InputState>,
+    filter_value: Entity<InputState>,
+    filter_operator: FilterOperator,
+    preview_sql: Option<Vec<String>>,
+    confirm_action: Option<ConfirmAction>,
+    request_generation: u64,
 
     // UI state
     show_inspector: bool,
@@ -398,6 +481,10 @@ impl Workspace {
             cx.new(|cx| InputState::new(window, cx).placeholder("Search connections"));
         let objects_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search objects"));
         let inspector_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search fields"));
+        let open_anything_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Open Anything…"));
+        let filter_column = cx.new(|cx| InputState::new(window, cx).placeholder("column"));
+        let filter_value = cx.new(|cx| InputState::new(window, cx).placeholder("value"));
         let dialog = ConnDialog::new(window, cx);
 
         let history =
@@ -478,6 +565,18 @@ impl Workspace {
             history,
             history_entries,
             console_log: Vec::new(),
+            tabs: vec![WorkspaceTab::query("query-1")],
+            active_tab: Some(0),
+            navigator_tab: 0,
+            show_open_anything: false,
+            open_anything_search,
+            show_filter_bar: false,
+            filter_column,
+            filter_value,
+            filter_operator: FilterOperator::Contains,
+            preview_sql: None,
+            confirm_action: None,
+            request_generation: 0,
             show_inspector: false,
             show_console: false,
             objects_tab: 0,
@@ -600,6 +699,15 @@ impl Workspace {
 
     fn connect_saved(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.connections.get(ix).cloned() else { return };
+        if !self.pending.is_empty() {
+            self.status = "Unsaved changes — commit or discard them before switching connections".into();
+            self.toast(
+                Notification::warning("Unsaved changes — commit or discard them before switching connections"),
+                window,
+                cx,
+            );
+            return;
+        }
         if self
             .active
             .as_ref()
@@ -788,7 +896,14 @@ impl Workspace {
         }
         let name = config.name.clone();
         self.connections.push(config);
-        store::save_connections(&self.connections);
+        if let Err(error) = store::save_connections(&self.connections) {
+            self.toast(
+                Notification::error(error.to_string()).title("Could not save connection"),
+                window,
+                cx,
+            );
+            return;
+        }
         self.log_console(true, "save connection", &name);
         self.toast(
             Notification::success(format!("Saved connection {name}")),
@@ -816,9 +931,16 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let cfg = Arc::clone(&config);
             let outcome = sqlpro_drivers::runtime::on_thread(move || {
-                sqlpro_drivers::create_driver(&cfg).map(|driver| driver.label().to_string())
+                sqlpro_drivers::create_driver(&cfg)
             })
             .await;
+            let outcome = match outcome {
+                Ok(driver) => match driver.ping().await {
+                    Ok(()) => Ok(driver.label().to_string()),
+                    Err(error) => Err(error.to_string()),
+                },
+                Err(error) => Err(error.to_string()),
+            };
             // The Box is dropped at the end of on_thread's task: closed.
             let msg = match outcome {
                 Ok(label) => Ok(label),
@@ -869,7 +991,14 @@ impl Workspace {
             saved.password = None;
         }
         self.connections.push(saved);
-        store::save_connections(&self.connections);
+        if let Err(error) = store::save_connections(&self.connections) {
+            self.toast(
+                Notification::error(error.to_string()).title("Could not save connection"),
+                window,
+                cx,
+            );
+            return;
+        }
         self.close_conn_dialog(cx);
         self.connect(Arc::new(config), None, window, cx);
     }
@@ -907,15 +1036,18 @@ impl Workspace {
                 }
             }
 
-            let tables = match &outcome {
-                Ok(driver) => driver.list_tables().await.unwrap_or_default(),
-                Err(_) => Vec::new(),
+            let outcome = match outcome {
+                Ok(driver) => match driver.list_tables().await {
+                    Ok(tables) => Ok((driver, tables)),
+                    Err(error) => Err(error.to_string()),
+                },
+                Err(error) => Err(error),
             };
 
             _ = this.update_in(cx, |ws, window, cx| {
                 ws.running = false;
                 match outcome {
-                    Ok(driver) => {
+                    Ok((driver, tables)) => {
                         ws.log_console(
                             true,
                             &format!("connect {}", config.name),
@@ -1113,6 +1245,25 @@ impl Workspace {
         if sql.trim().is_empty() {
             return;
         }
+        let risk = classify_statement_risk(&sql);
+        let (safety, tag) = self
+            .active
+            .as_ref()
+            .map(|config| (config.safety_level, config.tag.as_deref()))
+            .unwrap_or((sqlpro_core::safety::ConnectionSafetyLevel::WarnWrites, None));
+        let requirement = confirmation_requirement(safety, risk, tag);
+        if requirement.requires_confirmation() && self.confirm_action != Some(ConfirmAction::RunQuery) {
+            self.confirm_action = Some(ConfirmAction::RunQuery);
+            self.status = format!("{} requires confirmation", risk_label(risk));
+            self.toast(
+                Notification::warning(format!("{} requires confirmation — run again to confirm", risk_label(risk))),
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        self.confirm_action = None;
 
         self.running = true;
         self.status = "Running…".into();
@@ -1204,6 +1355,14 @@ impl Workspace {
         self.original_rows = result.rows.clone();
         self.rows = result.rows.clone();
         self.row_ids = (0..self.rows.len() as i64).map(RowID::Existing).collect();
+        // Arbitrary SQL results are read-only and must never inherit the last
+        // table's edit target or primary-key metadata.
+        if self.active_tab.is_none() || self.active_tab_kind() == Some(TabKind::Query) {
+            self.table_name.clear();
+            self.active_table = None;
+            self.pk_columns.clear();
+            self.structure.clear();
+        }
         self.pending.clear();
 
         self.table.update(cx, |table, cx| {
@@ -1220,14 +1379,43 @@ impl Workspace {
 
     fn open_table(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(table) = self.tables.get(ix) else { return };
-        let sql = format!(
-            "SELECT * FROM \"{}\" LIMIT {DEFAULT_ROW_LIMIT}",
-            table.name.replace('"', "\"\"")
-        );
+        if !self.pending.is_empty() {
+            self.status = "Unsaved changes — commit or discard them before opening another table".into();
+            self.toast(
+                Notification::warning("Unsaved changes — commit or discard them before opening another table"),
+                window,
+                cx,
+            );
+            return;
+        }
+        let engine = self
+            .active
+            .as_ref()
+            .map(|config| config.database_type.clone())
+            .unwrap_or_else(|| DatabaseType::new(DatabaseType::SQLITE));
+        let sql = TableQuery::new(&table.name, &engine)
+            .limit(DEFAULT_ROW_LIMIT as u64)
+            .build()
+            .map(|statement| statement.sql)
+            .unwrap_or_else(|_| format!("SELECT * FROM \"{}\" LIMIT {DEFAULT_ROW_LIMIT}", table.name.replace('"', "\"\"")));
         let sql_value = sql.clone();
         self.editor
             .update(cx, |editor, cx| editor.set_value(sql_value, window, cx));
-        self.table_name = table.name.clone();
+        let target = table.name.clone();
+        if let Some(existing) = self.tabs.iter().position(|tab| {
+            tab.kind == TabKind::Table && tab.origin_table.as_deref() == Some(target.as_str())
+        }) {
+            self.active_tab = Some(existing);
+        } else if let Some(preview) = self.tabs.iter().position(|tab| {
+            tab.kind == TabKind::Table && tab.preview && !tab.dirty && !tab.pinned
+        }) {
+            self.tabs[preview] = WorkspaceTab::table(target.clone(), true);
+            self.active_tab = Some(preview);
+        } else {
+            self.tabs.push(WorkspaceTab::table(target.clone(), true));
+            self.active_tab = Some(self.tabs.len() - 1);
+        }
+        self.table_name = target;
         self.active_table = Some(ix);
         self.grid_mode = GridMode::Data;
 
@@ -1264,9 +1452,92 @@ impl Workspace {
         self.run_query(&RunQuery, window, cx);
     }
 
+    fn open_anything_action(&mut self, _: &OpenAnything, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_open_anything = true;
+        cx.notify();
+    }
+
+    fn close_tab_action(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.active_tab {
+            self.close_tab(index, window, cx);
+        }
+    }
+
+    fn toggle_filter_bar_action(&mut self, _: &ToggleFilterBar, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_filter_bar = !self.show_filter_bar;
+        cx.notify();
+    }
+
+    fn preview_changes_action(&mut self, _: &PreviewChanges, window: &mut Window, cx: &mut Context<Self>) {
+        self.preview_changes(window, cx);
+    }
+
+    fn discard_changes_action(&mut self, _: &DiscardChanges, window: &mut Window, cx: &mut Context<Self>) {
+        self.discard_changes(window, cx);
+    }
+
+    fn preview_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending.is_empty() {
+            self.toast(Notification::info("No staged changes to preview"), window, cx);
+            return;
+        }
+        let engine = self
+            .active
+            .as_ref()
+            .map(|config| config.database_type.clone())
+            .unwrap_or_else(|| DatabaseType::new(DatabaseType::SQLITE));
+        let generator = SqlStatementGenerator::new(
+            self.table_name.clone(),
+            None,
+            self.columns.iter().map(|column| column.name.clone()).collect(),
+            self.pk_columns.clone(),
+            engine,
+            Default::default(),
+            Default::default(),
+            None,
+            false,
+            None,
+        );
+        let snapshot = self.pending.snapshot();
+        let statements = generator.generate_attributed_statements(
+            &snapshot.changes,
+            &snapshot.inserted_row_data,
+            &snapshot.deleted_row_ids,
+            &snapshot.inserted_row_ids,
+        );
+        self.preview_sql = Some(statements.into_iter().map(|statement| statement.statement.sql).collect());
+        cx.notify();
+    }
+
+    fn discard_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending.is_empty() {
+            return;
+        }
+        self.pending.clear();
+        let original_len = self.original_rows.len();
+        self.rows.truncate(original_len);
+        for (index, original) in self.original_rows.iter().enumerate() {
+            if let Some(row) = self.rows.get_mut(index) {
+                *row = original.clone();
+            }
+        }
+        self.row_ids = (0..original_len as i64).map(RowID::Existing).collect();
+        self.refresh_grid(cx);
+        self.status = "Discarded staged changes".into();
+        self.toast(Notification::info("Discarded staged changes"), window, cx);
+        cx.notify();
+    }
+
+    fn active_tab_kind(&self) -> Option<TabKind> {
+        self.active_tab.and_then(|index| self.tabs.get(index).map(|tab| tab.kind))
+    }
+
     fn new_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editor
             .update(cx, |editor, cx| editor.set_value("", window, cx));
+        let number = self.tabs.iter().filter(|tab| tab.kind == TabKind::Query).count() + 1;
+        self.tabs.push(WorkspaceTab::query(format!("query-{number}")));
+        self.active_tab = Some(self.tabs.len() - 1);
         self.table_name.clear();
         self.active_table = None;
         self.structure.clear();
@@ -1669,7 +1940,65 @@ impl Workspace {
         .detach();
     }
 
+    fn apply_table_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.table_name.is_empty() {
+            return;
+        }
+        let engine = self
+            .active
+            .as_ref()
+            .map(|config| config.database_type.clone())
+            .unwrap_or_else(|| DatabaseType::new(DatabaseType::SQLITE));
+        let column = self.filter_column.read(cx).value().trim().to_string();
+        let value = self.filter_value.read(cx).value().to_string();
+        let mut query = TableQuery::new(&self.table_name, &engine).limit(DEFAULT_ROW_LIMIT as u64);
+        if !column.is_empty() {
+            query = query.filter(FilterCondition::new(column, self.filter_operator, value));
+        }
+        if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get(index)) {
+            query = query.offset(tab.page_offset as u64);
+            for (column, direction) in &tab.sort {
+                query = query.sort_by(column.clone(), *direction);
+            }
+        }
+        match query.build() {
+            Ok(statement) => {
+                self.editor.update(cx, |editor, cx| editor.set_value(statement.sql, window, cx));
+                self.run_query(&RunQuery, window, cx);
+            }
+            Err(error) => {
+                self.status = format!("Filter failed: {error}");
+                self.toast(Notification::error(error.to_string()).title("Invalid filter"), window, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    fn next_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
+            if tab.kind == TabKind::Table {
+                tab.page_offset = tab.page_offset.saturating_add(DEFAULT_ROW_LIMIT);
+                self.apply_table_filter(window, cx);
+            }
+        }
+    }
+
+    fn previous_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_tab.and_then(|index| self.tabs.get_mut(index)) {
+            if tab.kind == TabKind::Table {
+                tab.page_offset = tab.page_offset.saturating_sub(DEFAULT_ROW_LIMIT);
+                self.apply_table_filter(window, cx);
+            }
+        }
+    }
+
     fn reload_current_table(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.pending.is_empty() {
+            self.status = "Unsaved changes — commit or discard them before refreshing".into();
+            self.toast(Notification::warning("Unsaved changes — commit or discard them before refreshing"), window, cx);
+            cx.notify();
+            return;
+        }
         if self.table_name.is_empty() {
             self.rows = self.original_rows.clone();
             self.row_ids = (0..self.rows.len() as i64).map(RowID::Existing).collect();
@@ -2044,6 +2373,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::copy_row_csv_action))
             .on_action(cx.listener(Self::insert_row_action))
             .on_action(cx.listener(Self::delete_row_action))
+            .on_action(cx.listener(Self::open_anything_action))
+            .on_action(cx.listener(Self::close_tab_action))
+            .on_action(cx.listener(Self::toggle_filter_bar_action))
+            .on_action(cx.listener(Self::preview_changes_action))
+            .on_action(cx.listener(Self::discard_changes_action))
             // Direct keyboard shortcuts on the root container. Handled in
             // the bubble phase so focused inputs keep their own keys;
             // matching is case-insensitive because macOS may deliver "S"
@@ -2072,8 +2406,23 @@ impl Render for Workspace {
                         ("e", true) | ("t", true) => entity.update(cx, |ws, ws_cx| {
                             ws.new_query(window, ws_cx);
                         }),
+                        ("p", true) => entity.update(cx, |ws, ws_cx| {
+                            ws.show_open_anything = true;
+                            ws.open_anything_search.update(ws_cx, |state, cx| state.focus(window, cx));
+                            ws_cx.notify();
+                        }),
+                        ("f", true) => entity.update(cx, |ws, ws_cx| {
+                            ws.show_filter_bar = !ws.show_filter_bar;
+                            ws_cx.notify();
+                        }),
                         ("escape", false) => entity.update(cx, |ws, ws_cx| {
-                            if ws.dialog_open {
+                            if ws.show_open_anything {
+                                ws.show_open_anything = false;
+                                ws_cx.notify();
+                            } else if ws.preview_sql.is_some() {
+                                ws.preview_sql = None;
+                                ws_cx.notify();
+                            } else if ws.dialog_open {
                                 ws.close_conn_dialog(ws_cx);
                             } else if ws.db_switch_open {
                                 ws.db_switch_open = false;
@@ -2275,6 +2624,14 @@ impl Render for Workspace {
                         })),
                 )
             })
+            // Open Anything is a keyboard-first command/object launcher.
+            .when(self.show_open_anything, |root| {
+                root.child(self.open_anything_overlay(cx))
+            })
+            // Generated SQL preview stays visible until the user dismisses it.
+            .when(self.preview_sql.is_some(), |root| {
+                root.child(self.preview_overlay(cx))
+            })
             // New-connection dialog paints over everything.
             .when(self.dialog_open, |root| {
                 root.child(self.conn_dialog_overlay(cx))
@@ -2284,6 +2641,31 @@ impl Render for Workspace {
 }
 
 /// Footer middle segment: staged count first, else the plain status text.
+fn classify_statement_risk(sql: &str) -> StatementRisk {
+    let leading = sql
+        .trim_start()
+        .trim_start_matches(['(', ';'])
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    match leading.as_str() {
+        "SELECT" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "WITH" | "TABLE" | "VALUES" | "PRAGMA" => StatementRisk::ReadOnly,
+        "DROP" | "TRUNCATE" | "DELETE" | "ALTER" | "GRANT" | "REVOKE" => StatementRisk::Destructive,
+        "INSERT" | "UPDATE" | "REPLACE" | "UPSERT" | "MERGE" | "CREATE" | "SET" | "VACUUM" | "ANALYZE" => StatementRisk::Write,
+        _ => StatementRisk::Unknown,
+    }
+}
+
+fn risk_label(risk: StatementRisk) -> &'static str {
+    match risk {
+        StatementRisk::ReadOnly => "Read-only query",
+        StatementRisk::Write => "Write statement",
+        StatementRisk::Destructive => "Destructive statement",
+        StatementRisk::Unknown => "Unknown statement",
+    }
+}
+
 fn when_pending(this: Div, pending_count: usize, status: &str) -> Div {
     if pending_count > 0 {
         this.text_color(color(COLOR_TEXT)).child(status.to_string())
@@ -2293,6 +2675,108 @@ fn when_pending(this: Div, pending_count: usize, status: &str) -> Div {
 }
 
 impl Workspace {
+    fn open_anything_overlay(&self, cx: &mut Context<Self>) -> Div {
+        let query = self.open_anything_search.read(cx).value().to_lowercase();
+        let matches = self
+            .tables
+            .iter()
+            .filter(|table| query.is_empty() || table.name.to_lowercase().contains(&query))
+            .take(8)
+            .enumerate()
+            .map(|(ix, table)| {
+                let name = table.name.clone();
+                let display_name = name.clone();
+                div()
+                    .id(SharedString::from(format!("anything-table-{ix}")))
+                    .h(px(30.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .rounded(px(4.))
+                    .hover(|this| this.bg(color(COLOR_HOVER)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.show_open_anything = false;
+                        if let Some(table_ix) = this.tables.iter().position(|table| table.name == name) {
+                            this.open_table(table_ix, window, cx);
+                        }
+                    }))
+                    .child("▦")
+                    .child(display_name)
+            })
+            .collect::<Vec<_>>();
+        let commands = [
+            ("+ SQL", "New query"),
+            ("⟳ Reload", "Reload current table"),
+            ("⌕ Filter", "Toggle table filter bar"),
+            ("◨ Details", "Toggle row details"),
+        ];
+
+        div()
+            .absolute()
+            .inset_0()
+            .bg(gpui::rgba(0x00000070))
+            .child(
+                v_flex()
+                    .occlude()
+                    .absolute()
+                    .top(px(76.))
+                    .left(px(280.))
+                    .w(px(460.))
+                    .max_h(px(420.))
+                    .overflow_hidden()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(color(COLOR_BORDER))
+                    .bg(color(COLOR_SURFACE2))
+                    .shadow_lg()
+                    .child(div().p_2().child(Input::new(&self.open_anything_search).small()))
+                    .child(
+                        v_flex()
+                            .id("anything-results")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .children(commands.iter().enumerate().filter_map(|(ix, (label, description))| {
+                                if query.is_empty() || label.to_lowercase().contains(&query) || description.to_lowercase().contains(&query) {
+                                    let label = *label;
+                                    Some(div().id(SharedString::from(format!("anything-command-{ix}"))).h(px(34.)).flex().items_center().gap_2().px_3().hover(|this| this.bg(color(COLOR_HOVER))).child(label).child(div().text_color(color(COLOR_MUTED)).text_size(px(11.)).child(*description)))
+                                } else {
+                                    None
+                                }
+                            }))
+                            .children(matches),
+                    )
+                    .child(div().px_3().py_1().text_size(px(10.5)).text_color(color(COLOR_MUTED)).child("Enter open · Esc close · ⌘P focus")),
+            )
+    }
+
+    fn preview_overlay(&self, cx: &mut Context<Self>) -> Div {
+        let statements = self.preview_sql.clone().unwrap_or_default();
+        div()
+            .absolute()
+            .inset_0()
+            .bg(gpui::rgba(0x00000070))
+            .child(
+                v_flex()
+                    .occlude()
+                    .absolute()
+                    .top(px(90.))
+                    .left(px(260.))
+                    .w(px(620.))
+                    .max_h(px(520.))
+                    .overflow_hidden()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(color(COLOR_BORDER))
+                    .bg(color(COLOR_SURFACE2))
+                    .shadow_lg()
+                    .child(h_flex().items_center().justify_between().px_3().py_2().border_b_1().border_color(color(COLOR_BORDER)).child(div().font_weight(FontWeight::MEDIUM).child("SQL Preview")).child(Button::new("close-preview").ghost().xsmall().label("×").on_click(cx.listener(|this, _, _, cx| { this.preview_sql = None; cx.notify(); }))))
+                    .child(v_flex().id("preview-statements").flex_1().min_h_0().overflow_y_scroll().children(statements.iter().enumerate().map(|(ix, sql)| div().id(SharedString::from(format!("preview-{ix}"))).p_2().border_b_1().border_color(color(COLOR_BORDER_SOFT)).font_family("Menlo").text_size(px(11.)).child(sql.clone()))))
+                    .child(h_flex().justify_between().px_3().py_2().border_t_1().border_color(color(COLOR_BORDER)).child(div().text_color(color(COLOR_MUTED)).text_size(px(10.5)).child("Review statements before Commit")).child(Button::new("preview-dismiss").small().outline().label("Close").on_click(cx.listener(|this, _, _, cx| { this.preview_sql = None; cx.notify(); })))),
+            )
+    }
+
     // ---- Start screen (no connection yet) ----
 
     /// The welcome screen shown while no database is connected: branding
@@ -2919,8 +3403,9 @@ impl Workspace {
                     .items_center()
                     .border_b_1()
                     .border_color(color(COLOR_BORDER_SOFT))
-                    .child(self.objects_tab_button("tab-items", "Items", 0, cx))
-                    .child(self.objects_tab_button("tab-history", "History", 1, cx)),
+                    .child(self.navigator_tab_button("nav-items", "Items", 0, cx))
+                    .child(self.navigator_tab_button("nav-queries", "Queries", 1, cx))
+                    .child(self.navigator_tab_button("nav-history", "History", 2, cx)),
             )
             .child(
                 h_flex()
@@ -2928,7 +3413,7 @@ impl Workspace {
                     .py_2()
                     .child(Input::new(&self.objects_search).small()),
             )
-            .when(self.objects_tab == 0, |this| {
+            .when(self.navigator_tab == 0, |this| {
                 this.child(
                     v_flex()
                         .id("object-list")
@@ -2988,7 +3473,47 @@ impl Workspace {
                         }),
                 )
             })
-            .when(self.objects_tab == 1, |this| {
+            .when(self.navigator_tab == 1, |this| {
+                let saved = SavedQueryStore::open_default()
+                    .ok()
+                    .and_then(|store| store.list().ok())
+                    .unwrap_or_default();
+                this.child(
+                    v_flex()
+                        .id("saved-query-list")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .children(saved.iter().enumerate().map(|(ix, query)| {
+                            let title = query.path.display().to_string();
+                            div()
+                                .id(SharedString::from(format!("saved-query-{ix}")))
+                                .h(px(28.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .mx_1()
+                                .rounded(px(4.))
+                                .text_size(px(11.5))
+                                .text_color(color(COLOR_MUTED))
+                                .hover(|this| this.bg(color(COLOR_HOVER)))
+                                .child("▤")
+                                .child(title)
+                        }))
+                        .when(saved.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .p_4()
+                                    .text_size(px(11.5))
+                                    .text_color(color(COLOR_MUTED))
+                                    .child("Save SQL files to ~/.local/share/sqlpro/saved_queries"),
+                            )
+                        }),
+                )
+            })
+            .when(self.navigator_tab == 2, |this| {
                 this.child(
                     v_flex()
                         .id("history-list")
@@ -3089,14 +3614,14 @@ impl Workspace {
             )
     }
 
-    fn objects_tab_button(
+    fn navigator_tab_button(
         &self,
         id: &'static str,
         label: &'static str,
         tab: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active = self.objects_tab == tab;
+        let active = self.navigator_tab == tab;
         div()
             .id(id)
             .h_full()
@@ -3110,7 +3635,7 @@ impl Workspace {
             .hover(|this| this.text_color(color(COLOR_TEXT)))
             .child(label)
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.objects_tab = tab;
+                this.navigator_tab = tab;
                 cx.notify();
             }))
     }
@@ -3176,6 +3701,77 @@ impl Workspace {
 
     // ---- Pane 3: query + data workspace ----
 
+    fn render_tab_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tabs = self.tabs.iter().enumerate().map(|(ix, tab)| {
+            let active = self.active_tab == Some(ix);
+            let title = tab.title.clone();
+            h_flex()
+                .id(SharedString::from(format!("workspace-tab-{ix}")))
+                .h(px(30.))
+                .flex_shrink_0()
+                .items_center()
+                .gap_1p5()
+                .px_2()
+                .border_r_1()
+                .border_color(color(COLOR_BORDER_SOFT))
+                .bg(if active { color(COLOR_BG) } else { color(COLOR_SURFACE) })
+                .text_color(if active { color(COLOR_TEXT) } else { color(COLOR_MUTED) })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.active_tab = Some(ix);
+                    cx.notify();
+                }))
+                .child(if tab.kind == TabKind::Table { "▦" } else { "▤" })
+                .child(title)
+                .when(tab.dirty || (active && !self.pending.is_empty()), |row| {
+                    row.child(div().w(px(5.)).h(px(5.)).rounded_full().bg(color(COLOR_AMBER)))
+                })
+                .child(
+                    div()
+                        .id(SharedString::from(format!("close-tab-{ix}")))
+                        .px_1()
+                        .text_color(color(COLOR_MUTED))
+                        .hover(|this| this.text_color(color(COLOR_TEXT)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.close_tab(ix, window, cx);
+                        }))
+                        .child("×"),
+                )
+        });
+
+        h_flex()
+            .w_full()
+            .h(px(30.))
+            .flex_shrink_0()
+            .items_center()
+            .bg(color(COLOR_SURFACE))
+            .border_b_1()
+            .border_color(color(COLOR_BORDER))
+            .children(tabs)
+            .child(div().flex_1())
+            .child(
+                Button::new("tab-new-query")
+                    .ghost()
+                    .xsmall()
+                    .label("+ SQL")
+                    .on_click(cx.listener(|this, _, window, cx| this.new_query(window, cx))),
+            )
+    }
+
+    fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(ix).cloned() else { return };
+        if tab.dirty || (self.active_tab == Some(ix) && !self.pending.is_empty()) {
+            self.status = "Tab has staged changes — use Discard or Commit first".into();
+            self.toast(Notification::warning("Tab has staged changes — use Discard or Commit first"), window, cx);
+            return;
+        }
+        self.tabs.remove(ix);
+        if self.tabs.is_empty() {
+            self.tabs.push(WorkspaceTab::query("query-1"));
+        }
+        self.active_tab = Some(self.active_tab.unwrap_or(0).min(self.tabs.len() - 1));
+        cx.notify();
+    }
+
     fn render_workspace_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         // h_full is load-bearing: without a definite height on this column,
         // every flex_1 child below collapses to content height.
@@ -3185,7 +3781,10 @@ impl Workspace {
             .min_w_0()
             .min_h_0()
             .overflow_hidden()
-            .child(self.render_editor_pane(cx))
+            .child(self.render_tab_strip(cx))
+            .when(self.active_tab_kind() == Some(TabKind::Query), |pane| {
+                pane.child(self.render_editor_pane(cx))
+            })
             .child(
                 v_flex()
                     .flex_1()
@@ -3193,7 +3792,10 @@ impl Workspace {
                     .min_w_0()
                     .overflow_hidden()
                     .child(self.render_grid_area(cx))
-                    .child(self.render_grid_action_strip(cx)),
+                    .child(self.render_grid_action_strip(cx))
+                    .when(self.show_filter_bar && self.active_tab_kind() == Some(TabKind::Table), |area| {
+                        area.child(self.render_filter_bar(cx))
+                    }),
             )
             .when(self.show_console, |this| this.child(self.render_console(cx)))
     }
@@ -3483,6 +4085,32 @@ impl Workspace {
                         this.delete_row(window, cx)
                     })),
             )
+            .child(
+                Button::new("toggle-filter")
+                    .ghost()
+                    .xsmall()
+                    .label("⌕ Filter")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_filter_bar = !this.show_filter_bar;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("prev-page")
+                    .ghost()
+                    .xsmall()
+                    .label("‹")
+                    .disabled(self.active_tab_kind() != Some(TabKind::Table))
+                    .on_click(cx.listener(|this, _, window, cx| this.previous_page(window, cx))),
+            )
+            .child(
+                Button::new("next-page")
+                    .ghost()
+                    .xsmall()
+                    .label("›")
+                    .disabled(self.active_tab_kind() != Some(TabKind::Table))
+                    .on_click(cx.listener(|this, _, window, cx| this.next_page(window, cx))),
+            )
             .child(div().flex_1())
             // Selection + staged summary
             .child(
@@ -3494,6 +4122,70 @@ impl Workspace {
                     } else {
                         "No staged changes".to_string()
                     }),
+            )
+    }
+
+    fn render_filter_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .id("table-filter-bar")
+            .w_full()
+            .h(px(36.))
+            .flex_shrink_0()
+            .items_center()
+            .gap_1p5()
+            .px_2()
+            .border_t_1()
+            .border_color(color(COLOR_BORDER))
+            .bg(color(COLOR_SURFACE))
+            .child(div().text_size(px(11.)).text_color(color(COLOR_MUTED)).child("Filter"))
+            .child(Input::new(&self.filter_column).small().w(px(120.)))
+            .child(
+                Button::new("filter-operator")
+                    .ghost()
+                    .xsmall()
+                    .label(match self.filter_operator {
+                        FilterOperator::Contains => "contains",
+                        FilterOperator::Equal => "=",
+                        FilterOperator::NotEqual => "≠",
+                        FilterOperator::LessThan => "<",
+                        FilterOperator::LessThanOrEqual => "≤",
+                        FilterOperator::GreaterThan => ">",
+                        FilterOperator::GreaterThanOrEqual => "≥",
+                        FilterOperator::NotContains => "not contains",
+                        FilterOperator::StartsWith => "starts with",
+                        FilterOperator::EndsWith => "ends with",
+                        FilterOperator::IsNull => "is null",
+                        FilterOperator::IsNotNull => "not null",
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.filter_operator = match this.filter_operator {
+                            FilterOperator::Contains => FilterOperator::Equal,
+                            FilterOperator::Equal => FilterOperator::StartsWith,
+                            FilterOperator::StartsWith => FilterOperator::EndsWith,
+                            FilterOperator::EndsWith => FilterOperator::NotContains,
+                            FilterOperator::NotContains => FilterOperator::Contains,
+                            other => other,
+                        };
+                        cx.notify();
+                    })),
+            )
+            .child(Input::new(&self.filter_value).small().w(px(150.)))
+            .child(
+                Button::new("apply-filter")
+                    .small()
+                    .primary()
+                    .label("Apply")
+                    .on_click(cx.listener(|this, _, window, cx| this.apply_table_filter(window, cx))),
+            )
+            .child(
+                Button::new("clear-filter")
+                    .ghost()
+                    .xsmall()
+                    .label("Clear")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_filter_bar = false;
+                        cx.notify();
+                    })),
             )
     }
 
@@ -3762,7 +4454,7 @@ impl Workspace {
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
-                .children(self.columns.iter().enumerate().filter(|(ix, column)| {
+                .children(self.columns.iter().enumerate().filter(|(_ix, column)| {
                     field_query.is_empty() || column.name.to_lowercase().contains(field_query)
                 }).map(|(ix, column)| {
                     let value = values

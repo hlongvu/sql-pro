@@ -6,7 +6,6 @@
 //! the hand-drawn panes at once.
 
 use gpui_kit::component::theme::{Theme, ThemeMode};
-use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use std::sync::atomic::{AtomicBool, Ordering};

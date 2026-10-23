@@ -196,6 +196,12 @@ fn quote_string(s: &str) -> String {
 
 #[async_trait::async_trait]
 impl sqlpro_core::write::ParameterizedExecutor for SqliteDriver {
+    async fn write_session(
+        &self,
+    ) -> sqlpro_core::error::Result<Box<dyn sqlpro_core::write::ParameterizedSession + '_>> {
+        Ok(sqlpro_core::write::default_write_session(self))
+    }
+
     async fn execute_parameterized(
         &self,
         sql: &str,
