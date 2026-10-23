@@ -1,0 +1,60 @@
+name: Release
+
+# Building and publishing is driven by merges to the `release` branch. The
+# version comes from [workspace.package] in the root Cargo.toml, so bump it
+# before merging or the tag guard below fails the run.
+"on":
+  push:
+    branches: [release]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-macos:
+    name: macOS DMG
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Determine version
+        id: version
+        run: |
+          version="$(awk -F'"' '/^version = /{ print $2; exit }' Cargo.toml)"
+          echo "Releasing version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Fail if tag v${{ steps.version.outputs.version }} already exists
+        run: |
+          tag="v${{ steps.version.outputs.version }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::Tag $tag already exists. Bump version in the root Cargo.toml ([workspace.package]) before merging to release."
+            exit 1
+          fi
+
+      - name: Build app bundle and DMG
+        run: ./scripts/package-macos-dmg.sh
+
+      - name: Create release and upload DMG
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: SQL Pro v${{ steps.version.outputs.version }}
+          files: dist/SQL-Pro-*.dmg
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            macOS (Apple Silicon) build of SQL Pro v${{ steps.version.outputs.version }}.
+
+            The DMG is ad-hoc signed but not notarized. On first launch, right-click
+            the app and choose **Open**, or run `xattr -cr "/Applications/SQL Pro.app"`.
